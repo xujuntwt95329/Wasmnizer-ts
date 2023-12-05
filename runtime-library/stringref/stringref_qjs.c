@@ -4,32 +4,13 @@
  */
 
 #include "string_object.h"
-#include "quickjs.h"
-#include "dynamic/type.h"
-
-static JSValue
-invoke_method(JSValue obj, const char *method, int argc, JSValue *args)
-{
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSContext *js_ctx = dyn_ctx->js_ctx;
-
-    // JSClassCall *call_func = NULL;
-    JSValue func = JS_GetPropertyStr(js_ctx, obj, method);
-    JSValue ret;
-
-    ret = JS_Call(js_ctx, func, obj, argc, args);
-    JS_FreeValue(js_ctx, func);
-
-    return ret;
-}
+#include "bh_platform.h"
 
 /******************* gc finalizer *****************/
 void
 wasm_string_destroy(WASMString str_obj)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str = JS_MKPTR(JS_TAG_STRING, (void *)str_obj);
-    JS_FreeValue(dyn_ctx->js_ctx, js_str);
+    wasm_runtime_free(str_obj);
 }
 /******************* opcode functions *****************/
 
@@ -37,10 +18,15 @@ wasm_string_destroy(WASMString str_obj)
 WASMString
 wasm_string_new_const(const char *content, uint32 length)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str = JS_NewStringLen(dyn_ctx->js_ctx, content, length);
+    char *str = wasm_runtime_malloc(length + 1);
+    if (!str) {
+        return NULL;
+    }
 
-    return JS_VALUE_GET_PTR(js_str);
+    bh_memcpy_s(str, length + 1, content, length);
+    str[length] = '\0';
+
+    return str;
 }
 
 /* string.new_xx8 */
@@ -50,10 +36,15 @@ wasm_string_new_const(const char *content, uint32 length)
 WASMString
 wasm_string_new_with_encoding(void *addr, uint32 count, EncodingFlag flag)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str = JS_NewStringLen(dyn_ctx->js_ctx, addr, count);
+    char *str = wasm_runtime_malloc(count + 1);
+    if (!str) {
+        return NULL;
+    }
 
-    return JS_VALUE_GET_PTR(js_str);
+    bh_memcpy_s(str, count + 1, addr, count);
+    str[count] = '\0';
+
+    return str;
 }
 
 /* string.measure */
@@ -61,13 +52,7 @@ wasm_string_new_with_encoding(void *addr, uint32 count, EncodingFlag flag)
 int32
 wasm_string_measure(WASMString str_obj, EncodingFlag flag)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str = JS_MKPTR(JS_TAG_STRING, str_obj);
-    JSValue length;
-
-    length = JS_GetPropertyStr(dyn_ctx->js_ctx, js_str, "length");
-
-    return JS_VALUE_GET_INT(length);
+    return strlen(str_obj);
 }
 
 /* stringview_wtf16.length */
@@ -87,23 +72,16 @@ int32
 wasm_string_encode(WASMString str_obj, uint32 pos, uint32 count, void *addr,
                    uint32 *next_pos, EncodingFlag flag)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str = JS_MKPTR(JS_TAG_STRING, str_obj);
-    const char *str = NULL;
-    size_t str_len = 0;
+    uint32 str_len = strlen(str_obj);
 
-    str = JS_ToCStringLen(dyn_ctx->js_ctx, &str_len, js_str);
-
-    /* If addr == NULL, just calculate the required length */
     if (addr) {
-        bh_memcpy_s(addr, str_len, str, str_len);
+        bh_memcpy_s(addr, str_len, str_obj, str_len);
     }
 
     if (next_pos) {
         *next_pos = pos + count;
     }
 
-    JS_FreeCString(dyn_ctx->js_ctx, str);
     return str_len;
 }
 
@@ -111,25 +89,14 @@ wasm_string_encode(WASMString str_obj, uint32 pos, uint32 count, void *addr,
 WASMString
 wasm_string_concat(WASMString str_obj1, WASMString str_obj2)
 {
-    JSValue js_str1 = JS_MKPTR(JS_TAG_STRING, str_obj1);
-    JSValue js_str2 = JS_MKPTR(JS_TAG_STRING, str_obj2);
-    JSValue js_str_res;
-
-    js_str_res = invoke_method(js_str1, "concat", 1, &js_str2);
-    return JS_VALUE_GET_PTR(js_str_res);
+    return NULL;
 }
 
 /* string.eq */
 int32
 wasm_string_eq(WASMString str_obj1, WASMString str_obj2)
 {
-    JSValue js_str1 = JS_MKPTR(JS_TAG_STRING, str_obj1);
-    JSValue js_str2 = JS_MKPTR(JS_TAG_STRING, str_obj2);
-    JSValue res;
-
-    res = invoke_method(js_str1, "localeCompare", 1, &js_str2);
-
-    return JS_VALUE_GET_INT(res) == 0 ? 1 : 0;
+    return strcmp(str_obj1, str_obj2) == 0;
 }
 
 /* string.is_usv_sequence */
@@ -145,11 +112,7 @@ wasm_string_is_usv_sequence(WASMString str_obj)
 WASMString
 wasm_string_create_view(WASMString str_obj, StringViewType type)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSValue js_str1 = JS_MKPTR(JS_TAG_STRING, str_obj);
-
-    JS_DupValue(dyn_ctx->js_ctx, js_str1);
-    return str_obj;
+    return NULL;
 }
 
 /* stringview_wtf8.advance */
@@ -168,15 +131,7 @@ WASMString
 wasm_string_slice(WASMString str_obj, uint32 start, uint32 end,
                   StringViewType type)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSContext *js_ctx = dyn_ctx->js_ctx;
-    JSValue js_str = JS_MKPTR(JS_TAG_STRING, str_obj);
-    JSValue args[2] = { JS_NewFloat64(js_ctx, start),
-                        JS_NewFloat64(js_ctx, end) };
-    JSValue js_str_res;
-
-    js_str_res = invoke_method(js_str, "slice", 2, args);
-    return JS_VALUE_GET_PTR(js_str_res);
+    return NULL;
 }
 
 /* stringview_wtf16.get_codeunit */
@@ -205,13 +160,5 @@ wasm_string_rewind(WASMString str_obj, uint32 pos, uint32 count,
 void
 wasm_string_dump(WASMString str_obj)
 {
-    DynTypeContext *dyn_ctx = dyntype_get_context();
-    JSContext *js_ctx = dyn_ctx->js_ctx;
-    JSValue js_str = JS_MKPTR(JS_TAG_STRING, str_obj);
-    const char *str;
-    size_t len;
-
-    str = JS_ToCStringLen(js_ctx, &len, js_str);
-    fwrite(str, 1, len, stdout);
-    JS_FreeCString(js_ctx, str);
+    os_printf("%s\n", str_obj);
 }

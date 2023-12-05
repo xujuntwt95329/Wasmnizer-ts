@@ -7,6 +7,7 @@
 #include "bh_platform.h"
 #include "quickjs.h"
 #include "libdyntype_export.h"
+#include "gc_object.h"
 
 void *
 Console_constructor(wasm_exec_env_t exec_env, void *obj)
@@ -48,6 +49,12 @@ Console_log(wasm_exec_env_t exec_env, void *thiz, void *obj)
     printf("\n");
 }
 
+void
+print_string(wasm_exec_env_t exec_env, void *str_obj)
+{
+    printf("%s\n", (char *)wasm_stringref_obj_get_value(str_obj));
+}
+
 /* clang-format off */
 #define REG_NATIVE_FUNC(func_name, signature) \
     { #func_name, func_name, signature, NULL }
@@ -55,6 +62,7 @@ Console_log(wasm_exec_env_t exec_env, void *thiz, void *obj)
 static NativeSymbol native_symbols[] = {
     REG_NATIVE_FUNC(Console_constructor, "(r)r"),
     REG_NATIVE_FUNC(Console_log, "(rr)"),
+    REG_NATIVE_FUNC(print_string, "(r)"),
     /* TODO */
 };
 /* clang-format on */
