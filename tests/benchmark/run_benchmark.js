@@ -17,6 +17,7 @@ const ts2wasm_script = path.join(benchmark_dir, '../../build/cli/ts2wasm.js');
 const iwasm_gc = path.join(benchmark_dir, '../../runtime-library/build/iwasm_gc');
 const default_qjs = path.join(benchmark_dir, '../../runtime-library/deps/quickjs/qjs');
 const wamrc = path.join(benchmark_dir, '../../runtime-library/deps/wamr-gc/wamr-compiler/build/wamrc');
+const struct_indirect_so = path.join(benchmark_dir, '../../runtime-library/struct-indirect/struct_indirect.so');
 const optimize_level = 3;
 const validate_res_error = 'Validate result error';
 
@@ -207,7 +208,7 @@ for (let benchmark of benchmarks) {
 
     console.log(`Compiling ${prefix} benchmark:`);
     execSync(`node ${ts2wasm_script} ${filename} --opt ${optimize_level} --output ${prefix}.wasm > tmp.txt`);
-    execSync(`${wamrc} --enable-gc -o ${prefix}.aot ${prefix}.wasm > tmp.txt`);
+    execSync(`${wamrc} --enable-gc --native-lib=${struct_indirect_so} -o ${prefix}.aot ${prefix}.wasm > tmp.txt`);
 
     if (specified_runtimes && !specified_runtimes.includes('wamr-interp')) {
         console.log(`\x1b[33mSkip WAMR interpreter due to argument filter.\x1b[0m`);
