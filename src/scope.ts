@@ -13,9 +13,18 @@ import {
     FunctionKind,
     getMethodPrefix,
     TSContext,
+    builtinWasmTypes,
 } from './type.js';
 import { ParserContext } from './frontend.js';
-import { parentIsFunctionLike, isTypeGeneric } from './utils.js';
+import {
+    parentIsFunctionLike,
+    isTypeGeneric,
+    NativeSignature,
+    Import,
+    Export,
+    parseComment,
+    parseCommentBasedFuncNode,
+} from './utils.js';
 import { Parameter, Variable } from './variable.js';
 import { Statement } from './statement.js';
 import { BuiltinNames } from '../lib/builtin/builtin_name.js';
@@ -43,6 +52,7 @@ export enum importSearchTypes {
     Type = 'type',
     Function = 'function',
     Namespace = 'namespace',
+    Class = 'class',
     All = 'all',
 }
 
@@ -64,6 +74,10 @@ export class Scope {
     private localIndex = -1;
     public mangledName = '';
     private modifiers: ts.Node[] = [];
+    // iff this Scope is specialized scope
+    private _genericOwner?: Scope;
+    // iff this Scope is a generic scope
+    private _specializedScopes?: Map<string, Scope>;
 
     constructor(parent: Scope | null) {
         this.parent = parent;
@@ -136,7 +150,7 @@ export class Scope {
         }
 
         if (this instanceof FunctionScope) {
-            this.localIndex = this.paramArray.length + this.envParamLen;
+            this.localIndex = this.paramArray.length + BuiltinNames.envParamLen;
         } else if (this instanceof GlobalScope) {
             this.localIndex = 0;
         } else {
@@ -147,9 +161,8 @@ export class Scope {
 
     initParamIndex() {
         if (this instanceof FunctionScope) {
-            const envParamLen = this.envParamLen;
             this.paramArray.forEach((p, index) => {
-                p.setVarIndex(index + envParamLen);
+                p.setVarIndex(index + BuiltinNames.envParamLen);
             });
         }
     }
@@ -177,6 +190,23 @@ export class Scope {
 
     addModifier(modifier: ts.Node) {
         this.modifiers.push(modifier);
+    }
+
+    setGenericOwner(genericOwner: Scope | undefined) {
+        this._genericOwner = genericOwner;
+    }
+
+    get genericOwner(): Scope | undefined {
+        return this._genericOwner;
+    }
+
+    addSpecializedScope(typeSignature: string, s: Scope) {
+        if (!this._specializedScopes) this._specializedScopes = new Map();
+        this._specializedScopes.set(typeSignature, s);
+    }
+
+    get specializedScopes() {
+        return this._specializedScopes;
     }
 
     protected _nestFindScopeItem<T>(
@@ -241,6 +271,15 @@ export class Scope {
             }
         }
 
+        if (!res && searchType === importSearchTypes.Type) {
+            for (const _importGlobalScope of scope.importGlobalScopeList) {
+                if (_importGlobalScope.namedTypeMap.has(name)) {
+                    res = _importGlobalScope.namedTypeMap.get(name);
+                    break;
+                }
+            }
+        }
+
         return res;
     }
 
@@ -286,6 +325,23 @@ export class Scope {
         );
     }
 
+    public findClassScope(
+        className: string,
+        nested = true,
+    ): ClassScope | undefined {
+        return this._nestFindScopeItem(
+            className,
+            (scope) => {
+                return scope.children.find((c) => {
+                    return (
+                        c instanceof ClassScope && c.className === className // not mangled
+                    );
+                }) as ClassScope;
+            },
+            nested,
+        );
+    }
+
     public findNamespaceScope(
         name: string,
         nested = true,
@@ -305,7 +361,12 @@ export class Scope {
     }
 
     public findType(typeName: string, nested = true): Type | undefined {
-        const res = builtinTypes.get(typeName);
+        let res = builtinTypes.get(typeName);
+        if (res) {
+            return res;
+        }
+
+        res = builtinWasmTypes.get(typeName);
         if (res) {
             return res;
         }
@@ -371,6 +432,9 @@ export class Scope {
                     /* Step4: Find namespace */
                     (matchStep(importSearchTypes.Namespace) &&
                         scope.findNamespaceScope(oriName, false)) ||
+                    /* Step5: Find class in current scope */
+                    (matchStep(importSearchTypes.Class) &&
+                        scope.findClassScope(oriName, false)) ||
                     undefined;
                 if (res) {
                     return res;
@@ -402,22 +466,35 @@ export class Scope {
         return this._getScopeByType<FunctionScope>(ScopeKind.FunctionScope);
     }
 
+    getNearestClosureEnvironment() {
+        let currentScope: Scope | null = this;
+        while (currentScope !== null) {
+            if (currentScope instanceof ClosureEnvironment) {
+                return currentScope;
+            }
+            currentScope = currentScope.parent;
+        }
+        return undefined;
+    }
+
     getRootGloablScope() {
         return this._getScopeByType<GlobalScope>(ScopeKind.GlobalScope);
     }
 
     getRootFunctionScope(): FunctionScope | null {
         let currentScope: Scope | null = this;
+        const flattenScopes: FunctionScope[] = [];
         while (currentScope !== null) {
-            if (
-                currentScope instanceof FunctionScope &&
-                currentScope.parent instanceof GlobalScope
-            ) {
-                return currentScope;
+            if (currentScope instanceof FunctionScope) {
+                flattenScopes.push(currentScope);
             }
             currentScope = currentScope.parent;
         }
-        return null;
+        if (flattenScopes.length === 0) {
+            return null;
+        } else {
+            return flattenScopes[flattenScopes.length - 1];
+        }
     }
 
     public addDeclareName(name: string) {
@@ -507,28 +584,11 @@ export class Scope {
         }
     }
 
-    // shadow copy
-    copy(scope: Scope) {
-        scope.kind = this.kind;
-        scope.name = this.name;
-        scope.children = this.children;
-        scope.parent = this.parent;
-        scope.namedTypeMap = this.namedTypeMap;
-        scope.debugFilePath = this.debugFilePath;
-        scope.tempVarArray = this.tempVarArray;
-        scope.variableArray = this.variableArray;
-        scope.statementArray = this.statementArray;
-        scope.localIndex = this.localIndex;
-        scope.mangledName = this.mangledName;
-        scope.modifiers = this.modifiers;
-    }
-
-    // deep copy
-    clone(scope: Scope) {
+    // process generic specialization
+    specialize(scope: Scope) {
         scope.kind = this.kind;
         scope.name = this.name;
         scope.children = new Array<Scope>();
-        scope.parent = this.parent;
         scope.namedTypeMap = new Map<string, Type>();
         scope.debugFilePath = this.debugFilePath;
         scope.tempVarArray = new Array<Variable>();
@@ -550,27 +610,17 @@ export class ClosureEnvironment extends Scope {
             this instanceof FunctionScope ||
             parent?.getNearestFunctionScope()
         ) {
-            /* Add context variable if this scope is inside a function scope */
+            /* Add 'context' variable if this scope is inside a function scope */
             const contextVar = new Variable('@context', new TSContext());
             this.addVariable(contextVar);
             this.contextVariable = contextVar;
         }
     }
 
-    copy(scope: ClosureEnvironment) {
-        super.copy(scope);
+    specialize(scope: ClosureEnvironment) {
+        super.specialize(scope);
         scope.kind = this.kind;
-        scope.parent = this.parent;
         scope.hasFreeVar = this.hasFreeVar;
-        scope.contextVariable = this.contextVariable;
-    }
-
-    clone(scope: ClosureEnvironment) {
-        super.clone(scope);
-        scope.kind = this.kind;
-        scope.parent = this.parent;
-        scope.hasFreeVar = this.hasFreeVar;
-        scope.contextVariable = this.contextVariable;
     }
 }
 
@@ -597,6 +647,7 @@ export class GlobalScope extends Scope {
 
     isCircularImport = false;
     importStartFuncNameList: string[] = [];
+    importGlobalScopeList: GlobalScope[] = [];
 
     constructor(parent: Scope | null = null) {
         super(parent);
@@ -663,7 +714,6 @@ export class GlobalScope extends Scope {
 export class FunctionScope extends ClosureEnvironment {
     kind = ScopeKind.FunctionScope;
     private parameterArray: Parameter[] = [];
-    envParamLen = 0;
     private functionType = new TSFunction();
     /* iff the function is a member function, which class it belong to */
     private _className = '';
@@ -671,8 +721,7 @@ export class FunctionScope extends ClosureEnvironment {
     /* ori func name iff func is declare */
     oriFuncName: string | undefined = undefined;
     debugLocations: SourceMapLoc[] = [];
-    // iff this FunctionScope is specialized
-    private _genericOwner?: FunctionScope;
+    comments: (NativeSignature | Import | Export)[] = [];
 
     constructor(parent: Scope) {
         super(parent);
@@ -726,36 +775,14 @@ export class FunctionScope extends ClosureEnvironment {
         return this._className !== '';
     }
 
-    setGenericOwner(genericOwner: FunctionScope) {
-        this._genericOwner = genericOwner;
-    }
-
-    get genericOwner(): FunctionScope | undefined {
-        return this._genericOwner;
-    }
-
-    copy(funcScope: FunctionScope) {
-        super.copy(funcScope);
+    specialize(funcScope: FunctionScope) {
+        super.specialize(funcScope);
         funcScope.kind = this.kind;
-        funcScope.parent = this.parent!;
-        funcScope.parameterArray = this.parameterArray;
-        funcScope.envParamLen = this.envParamLen;
-        funcScope.functionType = this.functionType;
-        funcScope._className = this._className;
-        funcScope.realParamCtxType = this.realParamCtxType;
-        funcScope.oriFuncName = this.oriFuncName;
-        funcScope.debugLocations = this.debugLocations;
-    }
-
-    clone(funcScope: FunctionScope) {
-        super.clone(funcScope);
-        funcScope.kind = this.kind;
-        funcScope.parent = this.parent!;
         funcScope.parameterArray = new Array<Parameter>();
-        funcScope.envParamLen = this.envParamLen;
         funcScope.functionType = this.functionType;
         funcScope._className = this._className;
         funcScope.realParamCtxType = this.realParamCtxType;
+        funcScope.mangledName = this.mangledName;
         funcScope.oriFuncName = this.oriFuncName;
         funcScope.debugLocations = new Array<SourceMapLoc>();
     }
@@ -782,8 +809,6 @@ export class BlockScope extends ClosureEnvironment {
 export class ClassScope extends Scope {
     kind = ScopeKind.ClassScope;
     private _classType: TSClass = new TSClass();
-    // iff this ClassScope is specialized
-    private _genericOwner?: ClassScope;
 
     constructor(parent: Scope, name = '') {
         super(parent);
@@ -803,26 +828,9 @@ export class ClassScope extends Scope {
         return this._classType;
     }
 
-    setGenericOwner(genericOwner: ClassScope) {
-        this._genericOwner = genericOwner;
-    }
-
-    get genericOwner(): ClassScope | undefined {
-        return this._genericOwner;
-    }
-
-    copy(classScope: ClassScope) {
-        super.copy(classScope);
+    specialize(classScope: ClassScope) {
+        super.specialize(classScope);
         classScope.kind = this.kind;
-        classScope.parent = this.parent;
-        classScope.name = this.name;
-        classScope._classType = this._classType;
-    }
-
-    clone(classScope: ClassScope) {
-        super.clone(classScope);
-        classScope.kind = this.kind;
-        classScope.parent = this.parent;
         classScope.name = this.name;
         classScope._classType = this._classType;
     }
@@ -851,6 +859,7 @@ export class ScopeScanner {
     /* block index to represent current block's count */
     blockIndex = 0;
     static literal_obj_count = 0;
+    static specializedScopeCache = new Map<Scope, Map<string, Scope>[]>();
 
     constructor(private parserCtx: ParserContext) {
         this.globalScopes = this.parserCtx.globalScopes;
@@ -858,26 +867,21 @@ export class ScopeScanner {
     }
 
     _generateClassFuncScope(
-        node:
-            | ts.AccessorDeclaration
-            | ts.MethodDeclaration
-            | ts.ConstructorDeclaration,
+        node: ts.FunctionLikeDeclaration,
         methodKind: FunctionKind,
+        needToAddThisVar = true,
     ) {
         const parentScope = this.currentScope!;
         const functionScope = new FunctionScope(parentScope);
+        parseCommentBasedFuncNode(node, functionScope);
         if (node.modifiers !== undefined) {
             for (const modifier of node.modifiers) {
                 functionScope.addModifier(modifier);
             }
         }
 
-        /* functionScope put @context env param defaultly */
-        functionScope.envParamLen++;
-
-        if (methodKind !== FunctionKind.STATIC) {
+        if (methodKind !== FunctionKind.STATIC && needToAddThisVar) {
             /* record '@this' as env param, add 'this' to varArray */
-            functionScope.envParamLen++;
             const thisVar = new Variable('this', new Type());
             thisVar.setVarIsClosure();
             functionScope.addVariable(thisVar);
@@ -887,6 +891,9 @@ export class ScopeScanner {
         let methodName = getMethodPrefix(methodKind);
         if (node.name) {
             methodName += node.name.getText();
+        }
+        if (!node.name && ts.isPropertyAssignment(node.parent)) {
+            methodName += node.parent.name.getText();
         }
 
         functionScope.setFuncName(methodName);
@@ -917,10 +924,9 @@ export class ScopeScanner {
                 globalScope.debugFilePath = sourceFileNode.fileName;
                 this.setCurrentScope(globalScope);
                 let moduleName = '';
-                const isBuiltInFile =
-                    sourceFileNode.fileName.includes(
-                        BuiltinNames.builtinImplementFileName,
-                    ) || getConfig().isBuiltIn;
+                const isBuiltInFile = sourceFileNode.fileName.includes(
+                    BuiltinNames.builtinImplementFileName,
+                );
                 if (isBuiltInFile) {
                     /* Use fixed name for builtin libraries, since currently
                         we use the moduleName as the import module name when
@@ -978,14 +984,24 @@ export class ScopeScanner {
                 this._generateFuncScope(funcDecl);
                 break;
             }
-            case ts.SyntaxKind.FunctionExpression: {
-                const funcExpr = <ts.FunctionExpression>node;
-                this._generateFuncScope(funcExpr);
-                break;
-            }
+            case ts.SyntaxKind.FunctionExpression:
             case ts.SyntaxKind.ArrowFunction: {
-                const arrowFunc = <ts.ArrowFunction>node;
-                this._generateFuncScope(arrowFunc);
+                const funcNode = node as ts.FunctionLikeDeclaration;
+                if (ts.isPropertyAssignment(node.parent)) {
+                    let needToAddThisVar = true;
+                    if (ts.isArrowFunction(node)) {
+                        needToAddThisVar = false;
+                    }
+                    this._generateClassFuncScope(
+                        funcNode,
+                        FunctionKind.METHOD,
+                        needToAddThisVar,
+                    );
+                } else if (ts.isPropertyDeclaration(node.parent)) {
+                    this._generateClassFuncScope(funcNode, FunctionKind.METHOD);
+                } else {
+                    this._generateFuncScope(funcNode);
+                }
                 break;
             }
             case ts.SyntaxKind.ClassDeclaration: {
@@ -1107,6 +1123,11 @@ export class ScopeScanner {
                 this.createLoopBlockScope(forOfStmtNode);
                 break;
             }
+            case ts.SyntaxKind.ForInStatement: {
+                const forInStmtNode = <ts.ForInStatement>node;
+                this.createLoopBlockScope(forInStmtNode);
+                break;
+            }
             case ts.SyntaxKind.WhileStatement: {
                 const whileStatementNode = <ts.WhileStatement>node;
                 this.createLoopBlockScope(whileStatementNode);
@@ -1206,11 +1227,10 @@ export class ScopeScanner {
         this.setCurrentScope(parentScope);
     }
 
-    private _generateFuncScope(
-        node: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction,
-    ) {
+    private _generateFuncScope(node: ts.FunctionLikeDeclaration) {
         const parentScope = this.currentScope!;
         const functionScope = new FunctionScope(parentScope);
+        parseCommentBasedFuncNode(node, functionScope);
         if (node.modifiers !== undefined) {
             for (const modifier of node.modifiers) {
                 functionScope.addModifier(modifier);
@@ -1220,14 +1240,9 @@ export class ScopeScanner {
         if (node.name !== undefined) {
             functionName = node.name.getText();
         } else {
-            if (ts.isPropertyAssignment(node.parent)) {
-                functionName = node.parent.name.getText();
-            } else {
-                functionName = '@anonymous' + this.anonymousIndex++;
-            }
+            functionName = '@anonymous' + this.anonymousIndex++;
         }
         /* function context struct placeholder */
-        functionScope.envParamLen = 1;
         this.nodeScopeMap.set(node, functionScope);
 
         if (functionScope.isDeclare()) {

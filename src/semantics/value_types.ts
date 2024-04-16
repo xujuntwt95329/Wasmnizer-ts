@@ -4,7 +4,14 @@
  */
 
 import { ObjectDescription, UnknownObjectDescription } from './runtime.js';
-import { DefaultTypeId, PredefinedTypeId } from '../utils.js';
+import {
+    DefaultTypeId,
+    MutabilityKind,
+    NullabilityKind,
+    PackedTypeKind,
+    PredefinedTypeId,
+} from '../utils.js';
+import { BuiltinNames } from '../../lib/builtin/builtin_name.js';
 
 export enum ValueTypeKind {
     PRIMITVE_BEGIN = 0,
@@ -33,6 +40,11 @@ export enum ValueTypeKind {
     EMPTY,
     TYPE_PARAMETER, // for template type parameter
     ENUM,
+    TUPLE,
+    WASM_I64,
+    WASM_F32,
+    WASM_ARRAY,
+    WASM_STRUCT,
 }
 
 export class ValueType {
@@ -63,6 +75,7 @@ export class ValueType {
 
     private _builtin_type = false;
     private _primitive_type = false;
+    private _wasm_type = false;
 
     get isBuiltin(): boolean {
         return this._builtin_type;
@@ -78,6 +91,14 @@ export class ValueType {
 
     setPrimitive() {
         this._primitive_type = true;
+    }
+
+    get isWASM(): boolean {
+        return this._wasm_type;
+    }
+
+    setWASM() {
+        this._wasm_type = true;
     }
 
     setGenericOwner(vt: ValueType) {
@@ -140,6 +161,90 @@ export const Primitive = {
     ),
 };
 
+export class WASMType extends ValueType {
+    constructor(kind: ValueTypeKind, typeId: number) {
+        super(kind, typeId);
+        this.setWASM();
+    }
+
+    toString(): string {
+        return `${ValueTypeKind[this.kind]}(${this.typeId})`;
+    }
+}
+
+export const WASM = {
+    I32: new WASMType(ValueTypeKind.INT, PredefinedTypeId.INT),
+    I64: new WASMType(ValueTypeKind.WASM_I64, PredefinedTypeId.WASM_I64),
+    F32: new WASMType(ValueTypeKind.WASM_F32, PredefinedTypeId.WASM_F32),
+    F64: new WASMType(ValueTypeKind.NUMBER, PredefinedTypeId.NUMBER),
+    ANYREF: new WASMType(ValueTypeKind.ANY, PredefinedTypeId.ANY),
+};
+
+export class WASMArrayType extends WASMType {
+    arrayType: ArrayType;
+    packedTypeKind: PackedTypeKind = PackedTypeKind.Not_Packed;
+    mutability: MutabilityKind = MutabilityKind.Mutable;
+    nullability: NullabilityKind = NullabilityKind.Nullable;
+
+    constructor(
+        arrayType: ArrayType,
+        packedTypeKind?: PackedTypeKind,
+        mutability?: MutabilityKind,
+        nullability?: NullabilityKind,
+    ) {
+        super(ValueTypeKind.WASM_ARRAY, PredefinedTypeId.WASM_ARRAY);
+        this.arrayType = arrayType;
+        if (packedTypeKind) {
+            this.packedTypeKind = packedTypeKind;
+        }
+        if (mutability) {
+            this.mutability = mutability;
+        }
+        if (nullability) {
+            this.nullability = nullability;
+        }
+    }
+}
+
+export class WASMStructType extends WASMType {
+    tupleType: TupleType;
+    packedTypeKinds: PackedTypeKind[];
+    mutabilitys: MutabilityKind[];
+    nullability: NullabilityKind = NullabilityKind.Nullable;
+    baseType: WASMStructType | undefined = undefined;
+
+    constructor(
+        tupleType: TupleType,
+        packedTypeKinds?: PackedTypeKind[],
+        mutabilitys?: MutabilityKind[],
+        nullability?: NullabilityKind,
+        baseType?: WASMStructType,
+    ) {
+        super(ValueTypeKind.WASM_STRUCT, PredefinedTypeId.WASM_STRUCT);
+        this.tupleType = tupleType;
+        if (packedTypeKinds) {
+            this.packedTypeKinds = packedTypeKinds;
+        } else {
+            this.packedTypeKinds = new Array<PackedTypeKind>(
+                this.tupleType.elements.length,
+            );
+            this.packedTypeKinds.fill(PackedTypeKind.Not_Packed);
+        }
+        if (mutabilitys) {
+            this.mutabilitys = mutabilitys;
+        } else {
+            this.mutabilitys = new Array<MutabilityKind>(
+                this.tupleType.elements.length,
+            );
+            this.mutabilitys.fill(MutabilityKind.Mutable);
+        }
+        if (nullability) {
+            this.nullability = nullability;
+        }
+        this.baseType = baseType;
+    }
+}
+
 export class EmptyType extends ValueType {
     constructor() {
         super(ValueTypeKind.EMPTY, PredefinedTypeId.EMPTY);
@@ -154,8 +259,6 @@ export class ClosureContextType extends ValueType {
         super(ValueTypeKind.CLOSURECONTEXT, PredefinedTypeId.CLOSURECONTEXT);
     }
 }
-
-type SpecializeTypeCache = [ValueType[], ValueType];
 
 export class ValueTypeWithArguments extends ValueType {
     constructor(kind: ValueTypeKind, typeId: number) {
@@ -367,44 +470,16 @@ export class ObjectType extends ValueTypeWithArguments {
 
         const other_type = other as ObjectType;
 
+        // if it is a comparison of two objectLiteral types, only need to determine whether their typeIds are the same.
+        if (
+            this.flags == ObjectTypeFlag.LITERAL &&
+            other_type.flags == ObjectTypeFlag.LITERAL
+        ) {
+            if (this.typeId == other_type.typeId) return true;
+            else return false;
+        }
+
         if (this.meta === other_type.meta) return true;
-
-        if (
-            !this.typeArguments &&
-            !other_type.typeArguments &&
-            (this.genericOwner || other_type.genericOwner)
-        ) {
-            const self_generic = this.genericOwner
-                ? (this.genericOwner as ObjectType)
-                : this;
-            const other_generic = other_type.genericOwner
-                ? (other_type.genericOwner as ObjectType)
-                : other_type;
-            return self_generic.meta === other_generic.meta;
-        }
-
-        if (!(this.genericOwner && other_type.genericOwner)) return false;
-
-        // is the same specialized object?
-        if (!this.genericOwner!.equals(other_type.genericOwner!)) return false;
-        // compare the specialTypeArguments
-        if (
-            this.specialTypeArguments &&
-            other_type.specialTypeArguments &&
-            this.specialTypeArguments.length ==
-                other_type.specialTypeArguments.length
-        ) {
-            for (let i = 0; i < this.specialTypeArguments.length; i++) {
-                if (
-                    !this.specialTypeArguments[i].equals(
-                        other_type.specialTypeArguments[i],
-                    )
-                ) {
-                    return false;
-                }
-            }
-            return true;
-        }
         return false;
     }
 
@@ -516,9 +591,9 @@ export class FunctionType extends ValueTypeWithArguments {
         typeId: number,
         public returnType: ValueType,
         public argumentsType: ValueType[],
-        public envParamLen = 0,
         public isOptionalParams: boolean[] = [],
         public restParamIdx = -1,
+        public envParamLen = BuiltinNames.envParamLen,
     ) {
         super(ValueTypeKind.FUNCTION, typeId);
     }
@@ -658,5 +733,19 @@ export class EnumType extends ValueType {
             }
         });
         return `EnumType[${this.name}](${s})`;
+    }
+}
+
+export class TupleType extends ValueType {
+    constructor(typeId: number, public elements: ValueType[]) {
+        super(ValueTypeKind.TUPLE, typeId);
+    }
+
+    toString(): string {
+        const ts: string[] = [];
+        for (const t of this.elements) {
+            ts.push(t.toString());
+        }
+        return `[TUPLE{${this.elements.join(',')}}}](${this.typeId})`;
     }
 }

@@ -7,22 +7,23 @@ import { Type, TypeKind } from '../../src/type';
 
 export namespace BuiltinNames {
     // wasm global variable
-    export const dataEnd = '~memory|data_end';
-    export const stackPointer = '~memory|stack_pointer';
-    export const heapBase = '~memory|heap_base';
+    export const dataEnd = '__data_end';
+    export const stackPointer = '__stack_pointer';
+    export const heapBase = '__heap_base';
 
     // wasm table
     export const extrefTable = 'extref_table';
 
     // wasm default variable
     export const byteSize = 32;
-    export const stackSize = 32768;
-    export const memoryOffset = 8;
+    export const stackSize = 1024;
     export const memInitialPages = 1;
     export const memMaximumPages = 10;
     export const tableInitialPages = 1;
     export const tableMaximumPages = 10;
     export const tableGrowDelta = 10;
+    export const memoryReserveOffset = 0;
+    export const memoryReserveMaxSize = 100;
 
     // wasm function
     export const start = '~start';
@@ -39,6 +40,13 @@ export namespace BuiltinNames {
     // builtin module name
     export const builtinModuleName = 'builtin';
 
+    // customize wasm util functions prefix name
+    export const utilsFuncName = 'utils';
+
+    // builtin libc functions
+    export const mallocFunc = 'malloc';
+    export const freeFunc = 'free';
+
     // builtin file name
     export const builtinTypeName = 'lib.type.d.ts';
     export const builtinImplementFileName = 'lib_builtin.ts';
@@ -46,11 +54,21 @@ export namespace BuiltinNames {
     // export const builtinFileNames = ['lib.type.d.ts'];
     export const builtinFileNames = [builtinTypeName, builtinImplementFileName];
 
+    // builtin function name
+    export const globalInitFuncName = 'global|init|func';
+    export const findPropertyFlagAndIndex = 'find_property_flag_and_index';
+    export const findPropertyType = 'find_property_type';
+    export const getInfcProperty = 'get_infc_property';
+    export const getTupleField = 'get_tuple_field';
+
     // builtin globals
     export const builtinTypeManglePrefix = 'lib/builtin/lib.type.d';
     export const nanName = `${builtinTypeManglePrefix}|NaN`;
     export const infinityName = `${builtinTypeManglePrefix}|Infinity`;
     export const builtinGlobalNames = [nanName, infinityName];
+
+    // default envParamLen
+    export const envParamLen = 2;
 
     // Globals that should be fallbacked to libdyntype
     export const jsonName = `${builtinTypeManglePrefix}|JSON`;
@@ -72,22 +90,10 @@ export namespace BuiltinNames {
     export const SET = 'Set';
     export const OBJECTCONSTRUCTOR = 'ObjectConstructor';
     export const FUNCTIONCONSTRCTOR = 'FunctionConstructor';
-
-    export const builtinIdentifierArray = [
-        MATH,
-        ARRAY,
-        STRING,
-        NUMBER,
-        BOOLEAN,
-        OBJECT,
-        FUNCTION,
-        CONSOLE,
-        PROMISE,
-        MAP,
-        SET,
-        OBJECTCONSTRUCTOR,
-        FUNCTIONCONSTRCTOR,
-    ];
+    export const ARRAYBUFFER = 'ArrayBuffer';
+    export const ARRAYBUFFERCONSTRCTOR = 'ArrayBufferConstructor';
+    export const DATAVIEW = 'DataView';
+    export const STRINGCONSTRCTOR = 'StringConstructor';
 
     // decorator name
     export const decorator = 'binaryen';
@@ -98,7 +104,7 @@ export namespace BuiltinNames {
     export const mathCeilFuncName = 'Math|ceil';
     export const mathFloorFuncName = 'Math|floor';
     export const mathTruncFuncName = 'Math|trunc';
-    export const arrayIsArrayFuncName = 'Array|isArray';
+    export const arrayIsArrayFuncName = 'ArrayConstructor|isArray';
     export const stringConcatFuncName = 'String|concat';
     export const stringSliceFuncName = 'String|slice';
     export const stringEQFuncName = 'string_eq';
@@ -119,7 +125,10 @@ export namespace BuiltinNames {
     export const newExtRef = 'newExtRef';
     export const allocExtRefTableSlot = 'allocExtRefTableSlot';
     export const extRefTableMaskArr = 'extRefTableMaskArr';
-    export const percent = 'percent';
+    export const getPropertyIfTypeIdMismatch =
+        'get_property_if_typeid_mismatch';
+    export const setPropertyIfTypeIdMismatch =
+        'set_property_if_typeid_mismatch';
 
     export const errorTag = 'error';
     export const finallyTag = 'finally';
@@ -244,7 +253,23 @@ export namespace BuiltinNames {
     ];
 
     export const JSGlobalObjects: Set<string> = new Set();
-    export const fallbackConstructors = ['Map', 'Set', 'Promise', 'Date'];
+    export const fallbackConstructors = [
+        'Map',
+        'Set',
+        'Promise',
+        'Date',
+        'Error',
+    ];
+    export const builtInObjectTypes = [
+        'ArrayBuffer',
+        'DataView',
+        'ArrayBufferConstructor',
+        'Math',
+        'Console',
+        'Array',
+        'ArrayConstructor',
+        'StringConstructor',
+    ];
 
     export function getSpecializedFuncName(
         mangledName: string,
@@ -267,4 +292,8 @@ export namespace BuiltinNames {
     }
     export const ObjectToStringMethod = 'toString';
     export const ObjectBuiltinMethods = [ObjectToStringMethod];
+    export const getPropNamesByMeta = 'get_prop_name_by_meta';
+
+    /* builtin constructor name */
+    export const ctorName = 'Constructor';
 }

@@ -34,11 +34,36 @@ dynamic_object_finalizer(wasm_anyref_obj_t obj, void *data);
 #define UNBOX_ANYREF(anyref) \
     (dyn_value_t) wasm_anyref_obj_get_value((wasm_anyref_obj_t)anyref)
 
+#define ENV_PARAM_LEN 2
+
+#define GET_ELEM_FROM_CLOSURE(closure)                                  \
+    wasm_value_t context = { 0 }, thiz = { 0 }, func_obj = { 0 };       \
+    wasm_struct_obj_get_field(closure, CONTEXT_INDEX, false, &context); \
+    wasm_struct_obj_get_field(closure, THIZ_INDEX, false, &thiz);       \
+    wasm_struct_obj_get_field(closure, FUNC_INDEX, false, &func_obj);
+
+#define POPULATE_ENV_ARGS(argv, total_size, occupied_slots, context, thiz)  \
+    /* arg0: context */                                                     \
+    bh_memcpy_s(argv, total_size, &context.gc_obj, sizeof(void *));         \
+    occupied_slots += sizeof(void *) / sizeof(uint32);                      \
+    /* arg1: thiz */                                                        \
+    bh_memcpy_s(argv + occupied_slots,                                      \
+                total_size - occupied_slots * sizeof(uint32), &thiz.gc_obj, \
+                sizeof(void *));                                            \
+    occupied_slots += sizeof(void *) / sizeof(uint32);
+
+enum closure_index {
+    CONTEXT_INDEX = 0,
+    THIZ_INDEX = 1,
+    FUNC_INDEX = 2,
+};
+
 enum field_flag {
     FIELD = 0,
     METHOD = 1,
     GETTER = 2,
     SETTER = 3,
+    ALL = 4,
 };
 
 typedef enum ts_value_type_t {
@@ -118,9 +143,28 @@ get_string_array_type(wasm_module_t wasm_module,
 bool
 is_ts_string_type(wasm_module_t wasm_module, wasm_defined_type_t type);
 
+#if WASM_ENABLE_STRINGREF != 0
 /* create wasm string from c string*/
+wasm_stringref_obj_t
+create_wasm_string(wasm_exec_env_t exec_env, const char *str);
+
+wasm_stringref_obj_t
+create_wasm_string_with_len(wasm_exec_env_t exec_env, const char *str,
+                            uint32_t len);
+
+/* get required space to store string contents, including the space for NULL
+ * terminator */
+uint32_t
+wasm_string_get_length(wasm_stringref_obj_t str_obj);
+
+/* covert wasm string to NULL terminated cstring */
+uint32_t
+wasm_string_to_cstring(wasm_stringref_obj_t str_obj, char *buffer,
+                       uint32_t len);
+#else
 wasm_struct_obj_t
 create_wasm_string(wasm_exec_env_t exec_env, const char *value);
+#endif
 
 
 /* combine elements of an array to an string */

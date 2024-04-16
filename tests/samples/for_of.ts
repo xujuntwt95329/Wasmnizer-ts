@@ -11,6 +11,9 @@ export function forOfForArray(): void {
     for (const element of arr) {
         console.log(element);
     }
+
+    for (const element of arr) console.log(element);
+
     const localArr = arr;
     for (const element of localArr) {
         console.log(element);
@@ -18,6 +21,7 @@ export function forOfForArray(): void {
     for (const element of dynArr) {
         console.log(element);
     }
+    for (const element of dynArr) console.log(element);
     const localDynArr = dynArr;
     for (const element of localDynArr) {
         console.log(element);
@@ -38,7 +42,7 @@ map.set('key2', 'value2');
 set.add('value1');
 set.add('value2');
 
-const mapKeys = map.keys();
+let mapKeys = map.keys();
 const mapValue = map.values();
 const mapEntries = map.entries();
 const setValues = set.values();
@@ -47,6 +51,9 @@ export function forOfForMapKeys() {
     for (const element of mapKeys) {
         console.log(element);
     }
+    mapKeys = map.keys();
+    for (const element of mapKeys)
+        console.log(element);
     const localMapKeys = map.keys();
     for (const element of localMapKeys) {
         console.log(element);
@@ -81,4 +88,31 @@ export function forOfForSetValues() {
     for (const element of localSetValues) {
         console.log(element);
     }
+}
+
+export function forOfWithContinue() {
+    const expect = ['1', '3', '5', 'h', 'l', 'l'];
+    const result: string[] = [];
+
+    const arr = [1, 2, 3, 4, 5];
+    for (const item of arr) {
+        if (item % 2 === 0) continue;
+        result.push(item.toString());
+    }
+
+    const str = 'hello';
+    for (const char of str) {
+        if (char === 'e' || char === 'o') continue;
+        result.push(char);
+    }
+
+    if (result.length !== expect.length) {
+        return false;
+    }
+    for (let i = 0; i < expect.length; i++) {
+        if (result[i] !== expect[i]) {
+            return false;
+        }
+    }
+    return true;
 }

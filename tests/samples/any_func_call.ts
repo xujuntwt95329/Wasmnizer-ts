@@ -39,7 +39,7 @@ export function anyFuncCallWithString() {
         return 'hi';
     };
     const fn2: any = (a: string): string => {
-        return a.concat(', world');
+        return a + (', world');
     };
     const a1 = fn1();
     console.log(a1);
@@ -197,4 +197,23 @@ export function anyFuncCallWithNoCast() {
     const b = a();
     b.log();
     b.increase();
+}
+
+class A1 {
+    test() {
+        console.log(1);
+    }
+}
+class B1 {
+    a?: A1 = new A1();
+    fun() {
+        if (this.a) {
+            this.a.test();
+        }
+    }
+}
+
+export function unionFuncCall() {
+    const b = new B1();
+    b.fun();
 }

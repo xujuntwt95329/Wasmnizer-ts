@@ -13,26 +13,35 @@ import {
     createSignatureTypeRefAndHeapTypeRef,
     Packed,
     generateArrayStructTypeInfo,
-    builtinFunctionType,
+    builtinClosureType,
     generateArrayStructTypeForRec,
     ptrToArray,
     baseVtableType,
     baseStructType,
 } from './glue/transform.js';
 import { assert } from 'console';
-import { infcTypeInfo, stringTypeInfo } from './glue/packType.js';
+import {
+    arrayBufferTypeInfo,
+    dataViewTypeInfo,
+    infcTypeInfo,
+    stringTypeInfo,
+} from './glue/packType.js';
 import { WASMGen } from './index.js';
 import {
     ArrayType,
     ClosureContextType,
     EmptyType,
+    EnumType,
     FunctionType,
     ObjectType,
     Primitive,
+    TupleType,
     TypeParameterType,
     UnionType,
     ValueType,
     ValueTypeKind,
+    WASMArrayType,
+    WASMStructType,
 } from '../../semantics/value_types.js';
 import { UnimplementError } from '../../error.js';
 import {
@@ -40,14 +49,20 @@ import {
     MemberType,
     ObjectDescription,
 } from '../../semantics/runtime.js';
-import { FunctionalFuncs, UtilFuncs, getCString } from './utils.js';
+import { FunctionalFuncs, UtilFuncs } from './utils.js';
 import { BuiltinNames } from '../../../lib/builtin/builtin_name.js';
 import { VarValue } from '../../semantics/value.js';
 import { needSpecialized } from '../../semantics/type_creator.js';
 import { getConfig } from '../../../config/config_mgr.js';
+import {
+    MutabilityKind,
+    NullabilityKind,
+    PackedTypeKind,
+} from '../../utils.js';
+import { typeInfo } from './glue/utils.js';
 
 export class WASMTypeGen {
-    typeMap: Map<ValueType, binaryenCAPI.TypeRef> = new Map();
+    private typeMap: Map<ValueType, binaryenCAPI.TypeRef> = new Map();
     /** it used for rec types, they share this._tb */
     private _tb: binaryenCAPI.TypeBuilderRef =
         binaryenCAPI._TypeBuilderCreate(1);
@@ -120,13 +135,15 @@ export class WASMTypeGen {
             case ValueTypeKind.NUMBER:
             case ValueTypeKind.STRING:
             case ValueTypeKind.RAW_STRING:
-            case ValueTypeKind.NULL:
             case ValueTypeKind.UNDEFINED:
             case ValueTypeKind.UNION:
             case ValueTypeKind.ANY:
             case ValueTypeKind.INT:
+            case ValueTypeKind.WASM_I64:
+            case ValueTypeKind.WASM_F32:
                 this.createWASMBaseType(type);
                 break;
+            case ValueTypeKind.NULL:
             case ValueTypeKind.EMPTY:
                 this.createWASMEmptyType(type);
                 break;
@@ -147,6 +164,16 @@ export class WASMTypeGen {
                 break;
             case ValueTypeKind.OBJECT:
                 this.createWASMObjectType(<ObjectType>type);
+                break;
+            case ValueTypeKind.ENUM:
+                this.createWASMEnumType(<EnumType>type);
+                break;
+            case ValueTypeKind.TUPLE:
+                this.createWASMTupleType(<TupleType>type);
+                break;
+            case ValueTypeKind.WASM_ARRAY:
+            case ValueTypeKind.WASM_STRUCT:
+                this.createWASMRawType(type);
                 break;
             default:
                 throw new UnimplementError(`createWASMType: ${type}`);
@@ -191,13 +218,16 @@ export class WASMTypeGen {
                 );
                 break;
             }
-            /** if type is null, then the value can only be null.
-             * We treat it as anyref here since it's nullable */
-            case ValueTypeKind.NULL:
             case ValueTypeKind.UNDEFINED:
             case ValueTypeKind.ANY:
             case ValueTypeKind.UNION:
                 this.typeMap.set(type, binaryen.anyref);
+                break;
+            case ValueTypeKind.WASM_I64:
+                this.typeMap.set(type, binaryen.i64);
+                break;
+            case ValueTypeKind.WASM_F32:
+                this.typeMap.set(type, binaryen.f32);
                 break;
             default:
                 break;
@@ -329,14 +359,18 @@ export class WASMTypeGen {
         }
 
         const closureStructType = initStructType(
-            [emptyStructType.typeRef, signature.typeRef],
-            [Packed.Not, Packed.Not],
-            [true, false],
-            2,
+            [
+                emptyStructType.typeRef,
+                emptyStructType.typeRef,
+                signature.typeRef,
+            ],
+            [Packed.Not, Packed.Not, Packed.Not],
+            [true, true, false],
+            3,
             true,
             closureTypeIdx,
             tb,
-            builtinFunctionType.heapTypeRef,
+            builtinClosureType.heapTypeRef,
         );
 
         if (buildIndex === -1) {
@@ -359,46 +393,10 @@ export class WASMTypeGen {
     }
 
     createWASMArrayType(arrayType: ArrayType) {
-        let elemType = arrayType.element;
-        if (
-            arrayType.typeId === -1 &&
-            arrayType.specialTypeArguments &&
-            arrayType.specialTypeArguments.length > 0
-        ) {
-            if (
-                !(
-                    arrayType.specialTypeArguments[0] instanceof
-                    TypeParameterType
-                ) ||
-                arrayType.specialTypeArguments[0].specialTypeArgument
-            ) {
-                /* workaround: non-builtin array will be specialized, so we can get the first elem in specialTypeArguments as elemType.
-                 * builtin array type (like array.map) may not be specialized, so we can not take it as elemType.
-                 */
-                /* get specialTypeArgument of generic type */
-                elemType = arrayType.specialTypeArguments![0];
-            }
-        }
-        const elemTypeRef = this.getWASMValueType(elemType);
-
         /** because array type maybe need to specialized, so the same arrayType may be parsed more than once, and binaryen will generate a new
          * wasm type which doesn't list in rec.
          */
-        const existArrayType = this.getExistWasmArrType(elemType);
-        if (existArrayType) {
-            this.oriArrayTypeMap.set(
-                arrayType,
-                this.oriArrayTypeMap.get(existArrayType)!,
-            );
-            this.oriArrayHeapTypeMap.set(
-                arrayType,
-                this.oriArrayHeapTypeMap.get(existArrayType)!,
-            );
-            this.typeMap.set(arrayType, this.typeMap.get(existArrayType)!);
-            this.heapTypeMap.set(
-                arrayType,
-                this.heapTypeMap.get(existArrayType)!,
-            );
+        if (this.getExistWasmArrType(arrayType)) {
             return;
         }
 
@@ -419,6 +417,7 @@ export class WASMTypeGen {
             this.oriArrayHeapTypeMap.set(arrayType, heapType);
         }
 
+        const elemTypeRef = this.getWASMValueType(arrayType.element);
         const arrayTypeInfo = initArrayType(
             elemTypeRef,
             Packed.Not,
@@ -456,22 +455,55 @@ export class WASMTypeGen {
         this.heapTypeMap.set(arrayType, arrayStructTypeInfo.heapTypeRef);
     }
 
+    createWASMArrayBufferType(type: ObjectType) {
+        this.typeMap.set(type, arrayBufferTypeInfo.typeRef);
+        this.heapTypeMap.set(type, arrayBufferTypeInfo.heapTypeRef);
+    }
+
+    createWASMDataViewType(type: ObjectType) {
+        this.typeMap.set(type, dataViewTypeInfo.typeRef);
+        this.heapTypeMap.set(type, dataViewTypeInfo.heapTypeRef);
+    }
+
+    createWASMBuiltinType(type: ObjectType) {
+        const builtinTypeName = type.meta.name;
+        switch (builtinTypeName) {
+            case BuiltinNames.ARRAYBUFFER: {
+                this.createWASMArrayBufferType(type);
+                break;
+            }
+            case BuiltinNames.DATAVIEW: {
+                this.createWASMDataViewType(type);
+                break;
+            }
+            default: {
+                throw new UnimplementError(
+                    `${builtinTypeName} builtin type is not supported`,
+                );
+            }
+        }
+    }
+
     createWASMObjectType(type: ObjectType) {
         const metaInfo = type.meta;
-        if (metaInfo.isInterface) {
-            this.createWASMInfcType(type);
-            this.createWASMClassType(type, true);
+        if (BuiltinNames.builtInObjectTypes.includes(metaInfo.name)) {
+            this.createWASMBuiltinType(type);
         } else {
-            if (type.meta.isObjectClass) {
-                this.createStaticFields(type);
+            if (metaInfo.isInterface) {
+                this.createWASMInfcType(type);
+                this.createWASMClassType(type, true);
             } else {
-                this.createWASMClassType(type);
-            }
-            if (
-                this.staticFieldsUpdateMap.has(type) &&
-                !this.staticFieldsUpdateMap.get(type)
-            ) {
-                this.updateStaticFields(type);
+                if (type.meta.isObjectClass) {
+                    this.createStaticFields(type);
+                } else {
+                    this.createWASMClassType(type);
+                }
+                if (
+                    this.staticFieldsUpdateMap.has(type) &&
+                    !this.staticFieldsUpdateMap.get(type)
+                ) {
+                    this.updateStaticFields(type);
+                }
             }
         }
     }
@@ -479,6 +511,191 @@ export class WASMTypeGen {
     createWASMInfcType(type: ObjectType) {
         this.typeMap.set(type, infcTypeInfo.typeRef);
         this.heapTypeMap.set(type, infcTypeInfo.heapTypeRef);
+    }
+
+    createWASMEnumType(type: EnumType) {
+        this.typeMap.set(type, this.getWASMValueType(type.memberType));
+    }
+
+    createWASMTupleType(type: TupleType) {
+        const fieldTypesListRef = new Array<binaryen.Type>();
+        for (const elementType of type.elements) {
+            fieldTypesListRef.push(this.getWASMValueType(elementType));
+        }
+        const fieldPackedTypesListRef = new Array<binaryenCAPI.PackedType>(
+            fieldTypesListRef.length,
+        ).fill(Packed.Not);
+        const fieldMutablesListRef = new Array<boolean>(
+            fieldTypesListRef.length,
+        ).fill(true);
+
+        const tb = binaryenCAPI._TypeBuilderCreate(1);
+        const buildIndex = this.createTbIndexForType(type);
+        const tupleTypeInfo = initStructType(
+            fieldTypesListRef,
+            fieldPackedTypesListRef,
+            fieldMutablesListRef,
+            fieldTypesListRef.length,
+            true,
+            buildIndex,
+            tb,
+        );
+
+        this.typeMap.set(type, tupleTypeInfo.typeRef);
+        this.heapTypeMap.set(type, tupleTypeInfo.heapTypeRef);
+    }
+
+    createWASMRawType(type: ValueType) {
+        if (this.typeMap.has(type)) {
+            return;
+        }
+
+        switch (type.kind) {
+            case ValueTypeKind.WASM_ARRAY:
+                this.createWASMArrayRawType(<WASMArrayType>type);
+                break;
+
+            case ValueTypeKind.WASM_STRUCT:
+                this.createWASMStructRawType(<WASMStructType>type);
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    createWASMArrayRawType(type: WASMArrayType) {
+        let arrRawTypeRef: binaryen.Type;
+        let arrRawHeapTypeRef: binaryenCAPI.HeapTypeRef;
+        let arrayRawTypeInfo: typeInfo;
+        if (
+            type.packedTypeKind === PackedTypeKind.Not_Packed &&
+            type.mutability === MutabilityKind.Mutable &&
+            type.nullability === NullabilityKind.Nullable
+        ) {
+            arrRawTypeRef = this.getWASMArrayOriType(type.arrayType);
+            arrRawHeapTypeRef = this.getWASMArrayOriHeapType(type.arrayType);
+            arrayRawTypeInfo = {
+                typeRef: arrRawTypeRef,
+                heapTypeRef: arrRawHeapTypeRef,
+            };
+        } else {
+            const elemTypeRef = this.getWASMValueType(type.arrayType.element);
+            let elementPackedType: binaryenCAPI.PackedType = Packed.Not;
+            switch (type.packedTypeKind) {
+                case PackedTypeKind.I8: {
+                    elementPackedType = Packed.I8;
+                    break;
+                }
+                case PackedTypeKind.I16: {
+                    elementPackedType = Packed.I16;
+                    break;
+                }
+            }
+            let elementMutable: binaryenCAPI.bool = true;
+            if (type.mutability === MutabilityKind.Immutable) {
+                elementMutable = false;
+            }
+            let nullable: binaryenCAPI.bool = true;
+            if (type.nullability === NullabilityKind.NonNullable) {
+                nullable = false;
+            }
+            const tb = binaryenCAPI._TypeBuilderCreate(1);
+            const buildIndex = this.createTbIndexForType(type.arrayType);
+            arrayRawTypeInfo = initArrayType(
+                elemTypeRef,
+                elementPackedType,
+                elementMutable,
+                nullable,
+                buildIndex,
+                tb,
+            );
+        }
+
+        this.typeMap.set(type, arrayRawTypeInfo.typeRef);
+        this.heapTypeMap.set(type, arrayRawTypeInfo.heapTypeRef);
+    }
+
+    createWASMStructRawType(type: WASMStructType) {
+        let structRawTypeRef: binaryen.Type;
+        let structRawHeapTypeRef: binaryenCAPI.HeapTypeRef;
+        let structRawTypeInfo: typeInfo;
+        const isEachFieldNotPacked = type.packedTypeKinds.every(
+            (value) => value === PackedTypeKind.Not_Packed,
+        );
+        const isEachFieldMutable = type.mutabilitys.every(
+            (value) => value === MutabilityKind.Mutable,
+        );
+        const isNullable =
+            type.nullability === NullabilityKind.Nullable ? true : false;
+        if (
+            isEachFieldNotPacked &&
+            isEachFieldMutable &&
+            isNullable &&
+            !type.baseType
+        ) {
+            structRawTypeRef = this.getWASMType(type.tupleType);
+            structRawHeapTypeRef = this.getWASMHeapType(type.tupleType);
+            structRawTypeInfo = {
+                typeRef: structRawTypeRef,
+                heapTypeRef: structRawHeapTypeRef,
+            };
+        } else {
+            const fieldTypesListRef = new Array<binaryen.Type>();
+            for (const elementType of type.tupleType.elements) {
+                fieldTypesListRef.push(this.getWASMValueType(elementType));
+            }
+            const fieldPackedTypesListRef = new Array<binaryenCAPI.PackedType>(
+                fieldTypesListRef.length,
+            );
+            for (const packedType of type.packedTypeKinds) {
+                let fieldPackedType = Packed.Not;
+                switch (packedType) {
+                    case PackedTypeKind.I8: {
+                        fieldPackedType = Packed.I8;
+                        break;
+                    }
+                    case PackedTypeKind.I16: {
+                        fieldPackedType = Packed.I16;
+                        break;
+                    }
+                }
+                fieldPackedTypesListRef.push(fieldPackedType);
+            }
+            const fieldMutablesListRef = new Array<boolean>(
+                fieldTypesListRef.length,
+            );
+            for (const mutability of type.mutabilitys) {
+                let fieldMutability = true;
+                if (mutability === MutabilityKind.Immutable) {
+                    fieldMutability = false;
+                }
+                fieldMutablesListRef.push(fieldMutability);
+            }
+            let nullable = true;
+            if (type.nullability === NullabilityKind.NonNullable) {
+                nullable = false;
+            }
+            const baseTypeRef = type.baseType
+                ? this.getWASMType(type.baseType)
+                : undefined;
+
+            const tb = binaryenCAPI._TypeBuilderCreate(1);
+            const buildIndex = this.createTbIndexForType(type.tupleType);
+            structRawTypeInfo = initStructType(
+                fieldTypesListRef,
+                fieldPackedTypesListRef,
+                fieldMutablesListRef,
+                fieldTypesListRef.length,
+                nullable,
+                buildIndex,
+                tb,
+                baseTypeRef,
+            );
+        }
+
+        this.typeMap.set(type, structRawTypeInfo.typeRef);
+        this.heapTypeMap.set(type, structRawTypeInfo.heapTypeRef);
     }
 
     getObjSpecialSuffix(type: ArrayType) {
@@ -496,6 +713,12 @@ export class WASMTypeGen {
                 case ValueTypeKind.INT:
                 case ValueTypeKind.BOOLEAN:
                     methodSuffix = '_i32';
+                    break;
+                case ValueTypeKind.WASM_F32:
+                    methodSuffix = '_f32';
+                    break;
+                case ValueTypeKind.WASM_I64:
+                    methodSuffix = '_i64';
                     break;
                 default:
                     methodSuffix = '_anyref';
@@ -642,7 +865,7 @@ export class WASMTypeGen {
                 this.infcObjHeapTypeMap.set(type, wasmClassType.heapTypeRef);
             } else {
                 /* vtable instance */
-                const vtableNameRef = getCString(
+                const vtableNameRef = UtilFuncs.getCString(
                     `vt-inst${this.structHeapTypeCnt}`,
                 );
                 const vtableInstance = this.createVtableInst(
@@ -718,7 +941,7 @@ export class WASMTypeGen {
             type.kind === ValueTypeKind.BOOLEAN ||
             type.kind === ValueTypeKind.NUMBER ||
             type.kind === ValueTypeKind.ANY ||
-            type.kind === ValueTypeKind.NULL
+            type.kind === ValueTypeKind.UNDEFINED
         ) {
             return false;
         }
@@ -859,10 +1082,10 @@ export class WASMTypeGen {
     updateStaticFields(type: ObjectType) {
         const metaInfo = type.meta;
         const name = metaInfo.name + '|static_fields';
-        this.wasmComp.globalInitArray.push(
+        this.wasmComp.globalInitFuncCtx.insert(
             binaryenCAPI._BinaryenGlobalSet(
                 this.wasmComp.module.ptr,
-                getCString(name),
+                UtilFuncs.getCString(name),
                 binaryenCAPI._BinaryenStructNew(
                     this.wasmComp.module.ptr,
                     arrayToPtr([]).ptr,
@@ -874,7 +1097,7 @@ export class WASMTypeGen {
         let staticFieldIdx = 0;
         const staticFields = binaryenCAPI._BinaryenGlobalGet(
             this.wasmComp.module.ptr,
-            getCString(name),
+            UtilFuncs.getCString(name),
             this.getWASMStaticFieldsType(type),
         );
         for (const member of metaInfo.members) {
@@ -895,8 +1118,11 @@ export class WASMTypeGen {
                     isMemFallBackType =
                         name == BuiltinNames.MAP || name == BuiltinNames.SET;
                 }
+                const curFuncCtx = this.wasmComp.currentFuncCtx;
+                this.wasmComp.currentFuncCtx = this.wasmComp.globalInitFuncCtx;
                 let wasmInitvalue =
                     this.wasmComp.wasmExprComp.wasmExprGen(initValue);
+                this.wasmComp.currentFuncCtx = curFuncCtx;
                 if (
                     memberType.kind === ValueTypeKind.ANY &&
                     valueType.kind !== ValueTypeKind.ANY &&
@@ -926,7 +1152,7 @@ export class WASMTypeGen {
                     staticFields,
                     wasmInitvalue,
                 );
-                this.wasmComp.globalInitArray.push(res);
+                this.wasmComp.globalInitFuncCtx.insert(res);
                 staticFieldIdx++;
             }
         }
@@ -940,7 +1166,7 @@ export class WASMTypeGen {
         binaryenCAPI._BinaryenModuleSetTypeName(
             this.wasmComp.module.ptr,
             heapTypeRef,
-            getCString(name),
+            UtilFuncs.getCString(name),
         );
     }
 
@@ -1079,7 +1305,7 @@ export class WASMTypeGen {
                 );
                 /** static fields */
                 /* vtable instance */
-                const vtableNameRef = getCString(
+                const vtableNameRef = UtilFuncs.getCString(
                     `vt-inst${this.structHeapTypeCnt++}`,
                 );
                 const vtableTypeRef = this.getWASMVtableType(type);
@@ -1141,20 +1367,31 @@ export class WASMTypeGen {
         return index;
     }
 
-    private getExistWasmArrType(elem: ValueType) {
-        if (!(elem instanceof ObjectType || elem instanceof FunctionType)) {
-            return null;
-        }
-
+    private getExistWasmArrType(arrayType: ArrayType) {
         for (const alreadyParsedType of this.typeMap.keys()) {
-            if (!(alreadyParsedType instanceof ArrayType)) {
-                continue;
-            }
-            if (alreadyParsedType.element === elem) {
-                return alreadyParsedType;
+            if (alreadyParsedType instanceof ArrayType) {
+                if (alreadyParsedType.toString() === arrayType.toString()) {
+                    this.oriArrayTypeMap.set(
+                        arrayType,
+                        this.oriArrayTypeMap.get(alreadyParsedType)!,
+                    );
+                    this.oriArrayHeapTypeMap.set(
+                        arrayType,
+                        this.oriArrayHeapTypeMap.get(alreadyParsedType)!,
+                    );
+                    this.typeMap.set(
+                        arrayType,
+                        this.typeMap.get(alreadyParsedType)!,
+                    );
+                    this.heapTypeMap.set(
+                        arrayType,
+                        this.heapTypeMap.get(alreadyParsedType)!,
+                    );
+                    return true;
+                }
             }
         }
-        return null;
+        return false;
     }
 
     private parseObjectMembers(
@@ -1219,6 +1456,17 @@ export class WASMTypeGen {
                             ),
                         );
                     }
+                } else {
+                    const getterTypeRef = binaryenCAPI._BinaryenTypeFuncref();
+                    methodTypeRefs.push(getterTypeRef);
+                    if (buildIndex === -1) {
+                        vtableFuncs.push(
+                            binaryenCAPI._BinaryenRefNull(
+                                this.wasmComp.module.ptr,
+                                getterTypeRef,
+                            ),
+                        );
+                    }
                 }
 
                 if (member.hasSetter) {
@@ -1243,11 +1491,22 @@ export class WASMTypeGen {
                             ),
                         );
                     }
+                } else {
+                    const setterTypeRef = binaryenCAPI._BinaryenTypeFuncref();
+                    methodTypeRefs.push(setterTypeRef);
+                    if (buildIndex === -1) {
+                        vtableFuncs.push(
+                            binaryenCAPI._BinaryenRefNull(
+                                this.wasmComp.module.ptr,
+                                setterTypeRef,
+                            ),
+                        );
+                    }
                 }
             } else if (member.type === MemberType.FIELD) {
                 let defaultValue = FunctionalFuncs.getVarDefaultValue(
                     this.wasmComp.module,
-                    member.valueType.kind,
+                    member.valueType,
                 );
                 if (member.valueType.kind === ValueTypeKind.ANY) {
                     defaultValue = FunctionalFuncs.generateDynUndefined(
@@ -1301,7 +1560,7 @@ export class WASMTypeGen {
         /** clazz meta */
         binaryenCAPI._BinaryenAddGlobal(
             this.wasmComp.module.ptr,
-            getCString(name),
+            UtilFuncs.getCString(name),
             staticStructType.typeRef,
             true,
             this.wasmComp.module.ref.null(
@@ -1352,7 +1611,7 @@ export class WASMTypeGen {
                 vtableHeapType,
             ),
         );
-        this.wasmComp.globalInitArray.push(initVtableInst);
+        this.wasmComp.globalInitFuncCtx.insert(initVtableInst);
         return binaryenCAPI._BinaryenGlobalGet(
             this.wasmComp.module.ptr,
             vtableNameRef,

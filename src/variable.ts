@@ -5,14 +5,14 @@
 
 import ts from 'typescript';
 import { Expression, IdentifierExpression } from './expression.js';
-import { TypeResolver, Type, TypeKind, TSFunction, TSEnum } from './type.js';
+import { TypeResolver, Type, TypeKind, TSEnum } from './type.js';
 import { ParserContext } from './frontend.js';
 import {
     addSourceMapLoc,
     generateNodeExpression,
     isScopeNode,
 } from './utils.js';
-import { ClassScope, FunctionScope, GlobalScope, Scope } from './scope.js';
+import { FunctionScope, GlobalScope, Scope } from './scope.js';
 import { getConfig } from '../config/config_mgr.js';
 
 export enum ModifierKind {
@@ -153,10 +153,12 @@ export class VariableScanner {
     globalScopes = new Array<GlobalScope>();
     currentScope: Scope | null = null;
     nodeScopeMap = new Map<ts.Node, Scope>();
+    typeResolver: TypeResolver;
 
     constructor(private parserCtx: ParserContext) {
         this.globalScopes = this.parserCtx.globalScopes;
         this.nodeScopeMap = this.parserCtx.nodeScopeMap;
+        this.typeResolver = this.parserCtx.typeResolver;
     }
 
     visit() {
@@ -203,17 +205,8 @@ export class VariableScanner {
                         paramModifiers.push(modifier.kind);
                     }
                 }
-                let typeString = this.typechecker!.typeToString(
-                    this.typechecker!.getTypeAtLocation(node),
-                );
-
-                /* builtin wasm types */
-                const maybeWasmType = TypeResolver.maybeBuiltinWasmType(node);
-                if (maybeWasmType) {
-                    typeString = maybeWasmType.getName();
-                }
-
-                const paramType = functionScope.findType(typeString);
+                const typeName = this.typeResolver.getTsTypeName(node);
+                const paramType = functionScope.findType(typeName);
                 const paramObj = new Parameter(
                     paramName,
                     paramType!,
@@ -255,29 +248,16 @@ export class VariableScanner {
                 }
 
                 const variableName = variableDeclarationNode.name.getText();
-                let typeName = this.typechecker!.typeToString(
-                    this.typechecker!.getTypeAtLocation(node),
-                );
-
-                /* builtin wasm types */
-                const maybeWasmType = TypeResolver.maybeBuiltinWasmType(node);
-                if (maybeWasmType) {
-                    typeName = maybeWasmType.getName();
-                }
+                const typeName = this.typeResolver.getTsTypeName(node);
                 let variableType = currentScope.findType(typeName);
+                if (!variableType) {
+                    throw new Error(
+                        `should get variableType for variable ${variableName}`,
+                    );
+                }
 
                 if (variableType instanceof TSEnum) {
                     variableType = variableType.memberType;
-                }
-                /* Sometimes the variable's type is inferred as a TSFunction with
-                    isDeclare == true, we need to treat it as non declare function
-                    here to keep the same calling convention for closure */
-                if (
-                    variableType instanceof TSFunction &&
-                    variableType.isDeclare
-                ) {
-                    variableType = variableType.clone();
-                    (variableType as TSFunction).isDeclare = false;
                 }
 
                 const variable = new Variable(

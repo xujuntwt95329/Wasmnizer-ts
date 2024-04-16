@@ -5,28 +5,24 @@
 
 export interface ConfigMgr {
     opt: number;
-    disableAny: boolean;
-    disableBuiltIn: boolean;
-    disableInterface: boolean;
-    isBuiltIn: boolean;
     debug: boolean;
     sourceMap: boolean;
     enableException: boolean;
     enableStringRef: boolean;
     entry: string;
+    startSection: boolean;
+    dumpSemanticTree: boolean;
 }
 
 const defaultConfig: ConfigMgr = {
     opt: 0,
-    disableAny: false,
-    disableBuiltIn: false,
-    disableInterface: false,
-    isBuiltIn: false,
     debug: false,
     sourceMap: false,
     enableException: false,
-    enableStringRef: false,
-    entry: '_start',
+    enableStringRef: true,
+    entry: '_entry',
+    startSection: false,
+    dumpSemanticTree: false,
 };
 
 let currentConfig: ConfigMgr = { ...defaultConfig };

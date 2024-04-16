@@ -38,7 +38,6 @@ import {
 } from './semantics_nodes.js';
 
 import { Variable } from '../variable.js';
-
 import { Scope, ScopeKind } from '../scope.js';
 
 import {
@@ -59,6 +58,7 @@ import {
     CatchClauseStatement,
     TryStatement,
     ThrowStatement,
+    ContinueStatement,
 } from '../statement.js';
 
 import {
@@ -109,7 +109,6 @@ export function createFromVariable(
             v.scope ? v.scope!.mangledName : ''
         })" type: ${type}`,
     );
-
     return new VarDeclareNode(
         storageType,
         type!,
@@ -134,7 +133,6 @@ export function createLocalSymbols(
 ): [VarDeclareNode[] | undefined, Map<SymbolKey, SymbolValue> | undefined] {
     let varList: VarDeclareNode[] | undefined = undefined;
     let symbols: Map<SymbolKey, SymbolValue> | undefined = undefined;
-
     const vararr = scope!.varArray;
     if (vararr.length > 0) {
         symbols = new Map<SymbolKey, SymbolValue>();
@@ -375,6 +373,7 @@ function buildBaseLoopStatement(
             : SemanticsKind.DOWHILE,
         statement.loopLabel,
         statement.loopBlockLabel,
+        statement.loopContinueLable,
         condition,
         body,
     );
@@ -436,6 +435,7 @@ function buildForStatement(
     return new ForNode(
         statement.forLoopLabel,
         statement.forLoopBlockLabel,
+        statement.forContinueLable,
         varList,
         initialize,
         condition,
@@ -491,6 +491,10 @@ function buildSwitchStatement(
 
 function buildBreakStatement(statement: BreakStatement): SemanticsNode {
     return new BreakNode(statement.breakLabel);
+}
+
+function buildContinueStatement(statement: ContinueStatement): SemanticsNode {
+    return new ContinueNode(statement.continueLabel);
 }
 
 function buildThrowStatement(
@@ -584,7 +588,6 @@ export function buildStatement(
             case ts.SyntaxKind.ForStatement:
                 res = buildForStatement(statement as ForStatement, context);
                 break;
-            case ts.SyntaxKind.ForInStatement:
             /* falls through */
             case ts.SyntaxKind.ExpressionStatement:
                 res = buildExpression(
@@ -612,6 +615,7 @@ export function buildStatement(
                 res = buildBreakStatement(statement as BreakStatement);
                 break;
             case ts.SyntaxKind.ContinueStatement:
+                res = buildContinueStatement(statement as ContinueStatement);
                 break;
             case ts.SyntaxKind.VariableStatement:
                 return buildVariableStatement(
@@ -672,6 +676,4 @@ export function buildStatement(
         Logger.error(`Source: ${tsNode.getFullText(sourceFile)}`);
         throw Error(e);
     }
-
-    return new EmptyNode();
 }

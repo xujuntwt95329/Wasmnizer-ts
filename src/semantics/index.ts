@@ -16,10 +16,12 @@ import {
     ExternModule,
     ExternType,
     ExternTypeKind,
+    NativeSignature,
 } from './semantics_nodes.js';
 import { Logger } from '../log.js';
 import { ParserContext } from '../frontend.js';
-import { TSClass, TSInterface } from '../type.js';
+import { TSClass, TSInterface, TypeResolver } from '../type.js';
+import { Parameter } from '../variable.js';
 import {
     ValueType,
     ValueTypeKind,
@@ -28,7 +30,11 @@ import {
     ObjectType,
     EnumType,
 } from './value_types.js';
-import { PredefinedTypeId } from '../utils.js';
+import {
+    PredefinedTypeId,
+    isNativeSignatureComment,
+    processGenericType,
+} from '../utils.js';
 import { GetPredefinedType } from './predefined_types.js';
 import { flattenFunction } from './flatten.js';
 import { BuildContext, SymbolKey, SymbolValue } from './builder_context.js';
@@ -55,9 +61,12 @@ import { Variable } from '../variable.js';
 import {
     ProcessBuiltinObjectSpecializeList,
     ForEachBuiltinObject,
+    builtin_objects,
 } from './builtin.js';
 import { ModDeclStatement, Statement } from '../statement.js';
 import { IdentifierExpression } from '../expression.js';
+import { BuiltinNames } from '../../lib/builtin/builtin_name.js';
+import { getConfig } from '../../config/config_mgr.js';
 
 function processTypes(context: BuildContext, globalScopes: Array<GlobalScope>) {
     for (const scope of globalScopes) {
@@ -121,13 +130,12 @@ function processGlobalStatements(context: BuildContext, g: GlobalScope) {
             s.isStartBasicBlock = true;
         }
     });
-    const block = new BlockNode(curStartStmts);
 
     const globalStart = new FunctionDeclareNode(
         g.startFuncName,
         FunctionOwnKind.START,
         GetPredefinedType(PredefinedTypeId.FUNC_VOID_VOID_NONE) as FunctionType,
-        block,
+        new BlockNode(curStartStmts),
     );
     globalStart.debugFilePath = g.debugFilePath;
     if (g === context.enterScope) {
@@ -140,6 +148,15 @@ function processGlobalStatements(context: BuildContext, g: GlobalScope) {
     flattenFunction(globalStart);
 
     context.module.functions.add(globalStart);
+
+    /* add global init function declaration */
+    const gloablInitFunc = new FunctionDeclareNode(
+        BuiltinNames.globalInitFuncName,
+        FunctionOwnKind.DEFAULT,
+        GetPredefinedType(PredefinedTypeId.FUNC_VOID_VOID_NONE) as FunctionType,
+        new BlockNode([]),
+    );
+    context.module.globalInitFunc = gloablInitFunc;
 }
 
 export function getFunctionOwnKind(f: FunctionScope): number {
@@ -199,22 +216,10 @@ function createFunctionDeclareNode(
         reverse[0] = '@' + reverse[0];
         name = reverse.reverse().join('|');
     }
-
     /* maybe can be replace to context.findSymbolKey(f.funcType) as FunctionType */
     const func_type = createType(context, f.funcType) as FunctionType;
     const this_type = getMethodClassType(f, context);
     const parameters: VarDeclareNode[] = [];
-    if (f.genericOwner) {
-        f.genericOwner.paramArray.forEach((p) => {
-            f.addParameter(p);
-        });
-        /* at this time, we set parameters for the specialized FunctionScope,
-         * so we need to initialize their index once
-         */
-        f.resetLocalIndex();
-        f.initVariableIndex();
-        f.initParamIndex();
-    }
     const paramArray = f.paramArray;
 
     for (let i = 0; i < paramArray.length; i++) {
@@ -247,10 +252,11 @@ function createFunctionDeclareNode(
         parameters.push(param);
     }
 
-    const parentCtx =
-        f.parent instanceof ClosureEnvironment
-            ? createFromVariable(f.parent.varArray[0], false, context)
-            : undefined;
+    const parentClosureEnvScope = f.parent?.getNearestClosureEnvironment();
+    const parentCtx = parentClosureEnvScope
+        ? createFromVariable(parentClosureEnvScope.varArray[0], false, context)
+        : undefined;
+
     const func = new FunctionDeclareNode(
         name,
         getFunctionOwnKind(f),
@@ -259,10 +265,25 @@ function createFunctionDeclareNode(
         parameters,
         undefined,
         parentCtx,
-        f.envParamLen,
         this_type,
     );
     func.debugFilePath = f.debugFilePath;
+    for (const comment of f.comments) {
+        if (isNativeSignatureComment(comment)) {
+            const paramValueTypes: ValueType[] = [];
+            for (const paramType of comment.paramTypes) {
+                paramValueTypes.push(createType(context, paramType));
+            }
+            const returnValueType = createType(context, comment.returnType);
+            const obj: NativeSignature = {
+                paramTypes: paramValueTypes,
+                returnType: returnValueType,
+            };
+            func.comments.push(obj);
+        } else {
+            func.comments.push(comment);
+        }
+    }
 
     return func;
 }
@@ -296,19 +317,14 @@ function processGlobalObjs(context: BuildContext, scope: Scope) {
             }`,
         );
 
-        if (!isInClosureScope(scope)) {
-            const var_func = new VarValue(
-                SemanticsValueKind.GLOBAL_CONST,
-                func.funcType,
-                func,
-                func.name,
-            );
-
-            context.globalSymbols.set(scope, var_func);
-            context.addFunctionValue(var_func);
-        } else {
-            context.globalSymbols.set(scope, func); // save func node only
-        }
+        const var_func = new VarValue(
+            SemanticsValueKind.GLOBAL_CONST,
+            func.funcType,
+            func,
+            func.name,
+        );
+        context.globalSymbols.set(scope, var_func);
+        context.addFunctionValue(var_func);
         context.module.functions.add(func);
     } else if (scope.kind == ScopeKind.ClassScope) {
         const class_scope = scope as ClassScope;
@@ -494,11 +510,6 @@ function generateFunctionScopeNodes(
 
     generateChildrenFunctionScope(context, scope);
 
-    if (scope.genericOwner) {
-        scope.genericOwner.statements.forEach((s) => {
-            scope.addStatement(s);
-        });
-    }
     const statements = buildStatements(context, scope.statements);
     func.body.statements = statements;
 
@@ -886,8 +897,10 @@ export function BuildModuleNode(parserContext: ParserContext): ModuleNode {
 
     context.finishBuild();
 
-    // module.dump(CreateDefaultDumpWriter());
-    // module.dumpCodeTrees(CreateDefaultDumpWriter());
+    if (getConfig().dumpSemanticTree) {
+        module.dump(CreateDefaultDumpWriter());
+        module.dumpCodeTrees(CreateDefaultDumpWriter());
+    }
     context.recClassTypeGroup = [];
     return module;
 }

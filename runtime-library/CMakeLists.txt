@@ -11,8 +11,16 @@ if (NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif ()
 
-set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdata-sections -ffunction-sections -Wall -Werror -Wformat")
-set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+if (NOT DEFINED USE_SIMPLE_LIBDYNTYPE)
+  set(USE_SIMPLE_LIBDYNTYPE 0)
+endif ()
+
+set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdata-sections -ffunction-sections -Wformat")
+
+if (NOT "${WAMR_BUILD_PLATFORM}" STREQUAL "darwin")
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Werror")
+    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
+endif()
 
 if (USE_SANITIZER EQUAL 1)
     message("Sanitizer enabled")
@@ -31,15 +39,24 @@ include(${CMAKE_CURRENT_LIST_DIR}/wamr_config.cmake)
 add_library(vmlib ${WAMR_RUNTIME_LIB_SOURCE})
 
 ## quickjs
-set(QUICKJS_SRC_DIR ${CMAKE_CURRENT_LIST_DIR}/deps/quickjs)
+if (NOT USE_SIMPLE_LIBDYNTYPE EQUAL 1)
+    set(QUICKJS_SRC_DIR ${CMAKE_CURRENT_LIST_DIR}/deps/quickjs)
 
-include_directories(${QUICKJS_SRC_DIR})
+    include_directories(${QUICKJS_SRC_DIR})
 
-set(QUICKJS_SOURCE
-    ${QUICKJS_SRC_DIR}/cutils.c
-    ${QUICKJS_SRC_DIR}/libregexp.c
-    ${QUICKJS_SRC_DIR}/libunicode.c
-    ${QUICKJS_SRC_DIR}/quickjs.c)
+    set(QUICKJS_SOURCE
+        ${QUICKJS_SRC_DIR}/cutils.c
+        ${QUICKJS_SRC_DIR}/libregexp.c
+        ${QUICKJS_SRC_DIR}/libunicode.c
+        ${QUICKJS_SRC_DIR}/quickjs.c)
+
+    # Ignore warnings of QuickJS
+    set_source_files_properties(
+        ${QUICKJS_SOURCE}
+        PROPERTIES
+        COMPILE_FLAGS "-w"
+    )
+endif ()
 
 ## libdyntype
 set(LIBDYNTYPE_DIR ${CMAKE_CURRENT_LIST_DIR}/libdyntype)
@@ -80,12 +97,6 @@ set(OBJECT_UTILS_SOURCE
 
 set(WAMR_UTILS_SOURCE
     ${UTILS_DIR}/wamr_utils.c
-)
-# Ignore warnings of QuickJS
-set_source_files_properties(
-    ${QUICKJS_SOURCE}
-    PROPERTIES
-    COMPILE_FLAGS "-w"
 )
 
 include (${SHARED_DIR}/utils/uncommon/shared_uncommon.cmake)

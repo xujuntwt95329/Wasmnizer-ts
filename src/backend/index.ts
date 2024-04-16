@@ -4,7 +4,7 @@
  */
 
 import { ParserContext } from '../frontend.js';
-import { utf16ToUtf8 } from './binaryen/utils.js';
+import { UtilFuncs } from './binaryen/utils.js';
 export { ParserContext } from '../frontend.js';
 
 export abstract class Ts2wasmBackend {
@@ -37,7 +37,7 @@ export class DataSegmentContext {
         this.metaMap = new Map<number, number>();
     }
 
-    addData(data: Uint8Array) {
+    addData(data: Uint8Array, alignment = 4) {
         /* there is no efficient approach to cache the data buffer,
             currently we don't cache it */
         const offset = this.currentOffset;
@@ -48,10 +48,16 @@ export class DataSegmentContext {
             offset: offset,
         });
 
+        if (alignment > 0) {
+            /* alignment */
+            this.currentOffset =
+                (this.currentOffset + (alignment - 1)) & ~(alignment - 1);
+        }
+
         return offset;
     }
 
-    addString(str: string) {
+    addString(str: string, alignment = 4) {
         if (this.stringOffsetMap.has(str)) {
             /* Re-use the string to save space */
             return this.stringOffsetMap.get(str)!;
@@ -60,7 +66,7 @@ export class DataSegmentContext {
         const offset = this.currentOffset;
         this.stringOffsetMap.set(str, offset);
 
-        const utf8Str = utf16ToUtf8(str);
+        const utf8Str = UtilFuncs.utf16ToUtf8(str);
         this.currentOffset += utf8Str.length + 1;
 
         const buffer = new Uint8Array(utf8Str.length + 1);
@@ -74,6 +80,12 @@ export class DataSegmentContext {
             data: buffer,
             offset: offset,
         });
+
+        if (alignment > 0) {
+            /* alignment */
+            this.currentOffset =
+                (this.currentOffset + (alignment - 1)) & ~(alignment - 1);
+        }
 
         return offset;
     }

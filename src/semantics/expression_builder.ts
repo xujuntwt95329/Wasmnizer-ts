@@ -19,8 +19,11 @@ import {
     EnumType,
     ObjectType,
     ValueTypeWithArguments,
+    WASMArrayType,
+    TupleType,
+    WASMStructType,
 } from './value_types.js';
-import { PredefinedTypeId, getNodeLoc } from '../utils.js';
+import { PredefinedTypeId, getNodeLoc, isTypeGeneric } from '../utils.js';
 import { Logger } from '../log.js';
 
 import {
@@ -32,6 +35,7 @@ import {
     createObjectType,
     SpecializeTypeMapper,
     CreateWideTypeFromTypes,
+    createTupleType,
 } from './type_creator.js';
 
 import { GetPredefinedType } from './predefined_types.js';
@@ -99,6 +103,7 @@ import {
     CommaExprValue,
     SpreadValue,
     TemplateExprValue,
+    EnumerateKeysGetValue,
 } from './value.js';
 
 import {
@@ -108,10 +113,6 @@ import {
     VarDeclareNode,
     ModuleNode,
 } from './semantics_nodes.js';
-
-import { InternalNames } from './internal.js';
-
-import { flattenConditionValue } from './flatten.js';
 
 import {
     Expression,
@@ -138,6 +139,7 @@ import {
     CommaExpression,
     SpreadExpression,
     TemplateExpression,
+    EnumerateKeysExpression,
 } from '../expression.js';
 
 import {
@@ -153,32 +155,21 @@ import {
 import {
     Type,
     TSClass,
-    TsClassField,
-    TsClassFunc,
-    FunctionKind,
     TypeKind,
-    TSFunction,
     TSArray,
-    TSInterface,
-    TSContext,
-    TSUnion,
-    builtinTypes,
+    TSTuple,
+    WasmStructType,
+    WasmArrayType,
 } from '../type.js';
 
 import {
     BuildContext,
     ValueReferenceKind,
     SymbolKeyToString,
-    SymbolKey,
     SymbolValue,
 } from './builder_context.js';
 
-import {
-    IsBuiltInType,
-    IsBuiltInTypeButAny,
-    IsBuiltInObjectType,
-    GetShapeFromType,
-} from './builtin.js';
+import { GetShapeFromType, builtinTypes } from './builtin.js';
 
 import {
     MemberType,
@@ -194,6 +185,7 @@ import {
 import { processEscape } from '../utils.js';
 import { BuiltinNames } from '../../lib/builtin/builtin_name.js';
 import { getConfig } from '../../config/config_mgr.js';
+import { UnimplementError } from '../error.js';
 
 function isInt(expr: Expression): boolean {
     /* TODO: currently we treat all numbers as f64, we can make some analysis and optimize some number to int */
@@ -323,8 +315,8 @@ function buildPropertyAccessExpression(
     // whether the context of property access is in the call expression
     let isMethodCall = false;
     if (
-        expr.tsNode &&
-        expr.tsNode.parent.kind == ts.SyntaxKind.CallExpression
+        expr.parent &&
+        expr.parent.expressionKind == ts.SyntaxKind.CallExpression
     ) {
         isMethodCall = true;
     }
@@ -344,10 +336,74 @@ function buildPropertyAccessExpression(
         return own;
     }
 
-    const member_name = (expr.propertyExpr as IdentifierExpression)
+    let member_name = (expr.propertyExpr as IdentifierExpression)
         .identifierName;
 
     const type = own.effectType;
+    /**
+     * e.g.
+     *  class A {
+     *      x: number;
+     *      constructor(x: number) {
+     *          this.x = x;
+     *      }
+     *
+     *      func<T>(param: T) {
+     *          return param;
+     *      }
+     *  }
+     *  const a: A = new A(1);
+     *  const ret = a.func(2);
+     */
+    if (isMethodCall) {
+        if (
+            expr.parent &&
+            type instanceof ObjectType &&
+            !type.genericOwner &&
+            isTypeGeneric(expr.propertyExpr.exprType)
+        ) {
+            // find the specialized method that needs to be called through the arguments list
+            const callExpr = expr.parent as CallExpression;
+            if (callExpr.callArgs && callExpr.callArgs.length > 0) {
+                const func_type = createType(
+                    context,
+                    expr.propertyExpr.exprType,
+                ) as FunctionType;
+                const paramterTypes = func_type.argumentsType;
+
+                const argumentTypes: ValueType[] = [];
+                const typeArguments: ValueType[] = [];
+                for (let i = 0; i < callExpr.callArgs.length; i++) {
+                    const arg = callExpr.callArgs[i];
+                    argumentTypes.push(buildExpression(arg, context).type);
+                }
+
+                for (let i = 0; i < paramterTypes.length; i++) {
+                    if (paramterTypes[i].kind == ValueTypeKind.TYPE_PARAMETER) {
+                        if (
+                            argumentTypes[i].kind !==
+                            ValueTypeKind.TYPE_PARAMETER
+                        )
+                            typeArguments.push(argumentTypes[i]);
+                    } else if (paramterTypes[i].kind == ValueTypeKind.ARRAY) {
+                        const elementType = (argumentTypes[i] as ArrayType)
+                            .element;
+                        if (elementType.kind !== ValueTypeKind.TYPE_PARAMETER)
+                            typeArguments.push(elementType);
+                    }
+                    const typeNames = new Array<string>();
+                    typeArguments.forEach((v) => {
+                        const name = `${ValueTypeKind[v.kind]}`;
+                        typeNames.push(name.toLowerCase());
+                    });
+                    if (typeNames.length > 0) {
+                        const typeSignature = '<' + typeNames.join(',') + '>';
+                        member_name = member_name + typeSignature;
+                    }
+                }
+            }
+        }
+    }
 
     if (type.kind == ValueTypeKind.ENUM) {
         const enum_type = type as EnumType;
@@ -424,7 +480,7 @@ function buildPropertyAccessExpression(
 
     const meta = shape!.meta;
     const isThisShape = meta.isObjectInstance;
-    const member = meta.findMember(member_name);
+    let member = meta.findMember(member_name);
     if (!member || BuiltinNames.fallbackConstructors.includes(own_name)) {
         Logger.warn(`WARNING Not found the member name, use dynamic Access`);
         if (BuiltinNames.fallbackConstructors.includes(own_name)) {
@@ -456,7 +512,17 @@ function buildPropertyAccessExpression(
             );
     }
 
+    /* Workaround: For obj property dynamic access, type member is not equal with shape member, so we should use type member to get DirectAccess value */
+    if (type instanceof ObjectType) {
+        const typeMeta = type.meta;
+        const typeMember = typeMeta.findMember(member_name);
+        if (typeMember && typeMember.valueType.kind !== member.valueType.kind) {
+            member = typeMember;
+        }
+    }
+
     return createDirectAccess(
+        context,
         own,
         shape_member,
         member,
@@ -480,7 +546,17 @@ function createDynamicAccess(
     }
     if (is_write) return new DynamicSetValue(own, name);
 
-    return new DynamicGetValue(own, name, is_method_call);
+    let type: ValueType | undefined = undefined;
+    if (
+        own.type.kind === ValueTypeKind.WASM_ARRAY ||
+        own.type.kind === ValueTypeKind.WASM_STRUCT ||
+        own.type.kind === ValueTypeKind.TUPLE
+    ) {
+        if (name === 'length') {
+            type = Primitive.Number;
+        }
+    }
+    return new DynamicGetValue(own, name, is_method_call, type);
 }
 
 function createShapeAccess(
@@ -519,6 +595,7 @@ function createVTableAccess(
 }
 
 function createDirectAccess(
+    context: BuildContext,
     own: SemanticsValue,
     shape_member: ShapeMember,
     member: MemberDescription,
@@ -536,6 +613,7 @@ function createDirectAccess(
         );
     } else {
         return createDirectGet(
+            context,
             own,
             shape_member,
             member,
@@ -546,6 +624,7 @@ function createDirectAccess(
 }
 
 function createDirectGet(
+    context: BuildContext,
     own: SemanticsValue,
     shape_member: ShapeMember,
     member: MemberDescription,
@@ -564,20 +643,29 @@ function createDirectGet(
             const getter = accessor.getter;
             if (!getter) {
                 Logger.info('==== getter is not exist, access by shape');
-                if (isThisShape)
-                    return createVTableAccess(own, member, false, true);
-                return createShapeAccess(own, member, false, true);
+                return new LiteralValue(Primitive.Undefined, undefined);
             }
             if (accessor.isOffset) {
                 return new OffsetGetterValue(
                     own,
-                    member.valueType,
+                    member.getterType!,
                     accessor.getterOffset!,
                 );
             } else {
+                const ownerType = context.metaAndObjectTypeMap.get(
+                    (own as VarValue).shape!.meta,
+                )!;
+                const getterOwnerType = (
+                    (getter as VarValue).ref as FunctionDeclareNode
+                ).thisClassType!.instanceType!;
+                // if the value of 'isOwn' is false, it means that the getter and setter are both not reimplemented in the sub class.
+                // when only the setter is reimplemented in the sub class and the getter is inherited from the base class, the getter returns undefined.
+                if (member.isOwn && !ownerType.equals(getterOwnerType))
+                    return new LiteralValue(Primitive.Undefined, undefined);
+
                 return new DirectGetterValue(
                     own,
-                    member.valueType,
+                    member.getterType!,
                     accessor.getterValue!,
                 );
             }
@@ -647,14 +735,14 @@ function createDirectSet(
             if (accessor.isOffset) {
                 return new OffsetSetterValue(
                     own,
-                    member.valueType,
+                    member.setterType!,
                     accessor.setterOffset!,
                     accessor.getterOffset,
                 );
             } else {
                 return new DirectSetterValue(
                     own,
-                    member.valueType,
+                    member.setterType!,
                     accessor.setterValue!,
                     accessor.getterValue,
                 );
@@ -723,7 +811,6 @@ function buildIdentiferExpression(
     context: BuildContext,
 ): SemanticsValue {
     const name = expr.identifierName;
-
     if (name == 'undefined') {
         return new LiteralValue(Primitive.Undefined, undefined);
     }
@@ -741,7 +828,13 @@ function buildIdentiferExpression(
     }
     if (!ret) {
         Logger.debug(`=== try find identifer "${name}" as Function Faield`);
-        ret = context.findType(name);
+        ret = context.findClass(name);
+    }
+    if (!ret) {
+        Logger.debug(`=== try find identifer "${name}" as Class Faield`);
+        ret = builtinTypes.get(name)
+            ? builtinTypes.get(name)
+            : context.findType(name);
     }
     if (!ret) {
         Logger.debug(`=== try find identifer "${name}" as Type Faield`);
@@ -869,35 +962,50 @@ function buildArrayLiteralExpression(
         if (
             expr.exprType instanceof TSArray &&
             expr.exprType.elementType.kind == TypeKind.UNKNOWN
-        )
+        ) {
             return new NewArrayLenValue(
                 GetPredefinedType(PredefinedTypeId.ARRAY_ANY)! as ArrayType,
                 new LiteralValue(Primitive.Int, 0),
             );
+        }
     }
 
     const init_values: SemanticsValue[] = [];
-    let array_type = context.findValueType(expr.exprType);
-
-    let init_types: Set<ValueType> | undefined = undefined;
-    if (!array_type || array_type.kind != ValueTypeKind.ARRAY) {
-        init_types = new Set<ValueType>();
+    let arrayLiteral_type = context.findValueType(expr.exprType);
+    /* ArrayLiteral may be array type, and it can be tuple type */
+    let init_array_types: Set<ValueType> | undefined = undefined;
+    if (!arrayLiteral_type || arrayLiteral_type.kind != ValueTypeKind.ARRAY) {
+        init_array_types = new Set<ValueType>();
     }
 
-    let element_type: ValueType | undefined;
-    if (array_type instanceof ArrayType) {
-        element_type = (<ArrayType>array_type).element;
+    // element type calculated from exprType
+    let element_type: ValueType | undefined = undefined;
+    if (arrayLiteral_type instanceof ArrayType) {
+        element_type = (<ArrayType>arrayLiteral_type).element;
+    }
+    if (expr.exprType instanceof WasmArrayType) {
+        element_type = createType(context, expr.exprType.arrayType.elementType);
     }
 
-    for (const element of expr.arrayValues) {
+    for (let i = 0; i < expr.arrayValues.length; i++) {
+        const element = expr.arrayValues[i];
         context.pushReference(ValueReferenceKind.RIGHT);
         let v = buildExpression(element, context);
-        if (element_type != undefined) {
+        /* get element type if exprType is TSTuple */
+        if (expr.exprType instanceof TSTuple) {
+            element_type = createType(context, expr.exprType.elements[i]);
+        } else if (expr.exprType instanceof WasmStructType) {
+            element_type = createType(
+                context,
+                expr.exprType.tupleType.elements[i],
+            );
+        }
+        if (element_type !== undefined) {
             v = newCastValue(element_type, v);
         }
         context.popReference();
         init_values.push(v);
-        // if v is SpreadValue, add it's elem-type to init_types
+        /* if v is SpreadValue, add it's elem-type to init_types */
         let v_type = v.type;
         if (v instanceof SpreadValue) {
             const target = v.target;
@@ -907,30 +1015,54 @@ function buildArrayLiteralExpression(
                 v_type = target.type;
             }
         }
-        if (init_types) {
-            init_types.add(v_type);
+        if (init_array_types) {
+            init_array_types.add(v_type);
         }
     }
 
-    if (init_types) {
-        array_type = createArrayType(
+    if (init_array_types) {
+        arrayLiteral_type = createArrayType(
             context,
-            CreateWideTypeFromTypes(context, init_types),
+            CreateWideTypeFromTypes(context, init_array_types),
         );
     }
 
-    // return new NewLiteralArrayValue(array_type!, init_values);
-    const elem_type = (array_type as ArrayType).element;
-    return new NewLiteralArrayValue(
-        array_type!,
-        expr.arrayValues.length == 0
-            ? []
-            : init_values.map((v) => {
-                  return elem_type.equals(v.type)
-                      ? v
-                      : newCastValue(elem_type, v);
-              }),
-    );
+    if (expr.exprType instanceof TSTuple) {
+        return new NewLiteralArrayValue(
+            createType(context, expr.exprType),
+            init_values,
+        );
+    } else if (expr.exprType instanceof WasmStructType) {
+        return new NewLiteralArrayValue(
+            createType(context, expr.exprType),
+            init_values,
+        );
+    } else {
+        const elem_type = (arrayLiteral_type as ArrayType).element;
+        const initValues =
+            expr.arrayValues.length == 0
+                ? []
+                : init_values.map((v) => {
+                      return elem_type.equals(v.type)
+                          ? v
+                          : newCastValue(elem_type, v);
+                  });
+        /* process generic array type */
+        if (initValues.length > 0) {
+            // actual element type
+            const value_type = initValues[0].type;
+            if (
+                elem_type.kind == ValueTypeKind.TYPE_PARAMETER &&
+                !value_type.equals(elem_type)
+            )
+                arrayLiteral_type = createArrayType(context, value_type);
+        }
+        let literalArrayType = arrayLiteral_type!;
+        if (expr.exprType instanceof WasmArrayType) {
+            literalArrayType = createType(context, expr.exprType);
+        }
+        return new NewLiteralArrayValue(literalArrayType, initValues);
+    }
 }
 
 export function isEqualOperator(kind: ts.SyntaxKind): boolean {
@@ -985,6 +1117,48 @@ function wrapObjToAny(value: SemanticsValue, type: ValueType) {
     return new CastValue(SemanticsValueKind.OBJECT_CAST_ANY, type, value);
 }
 
+function checkSigned(tmpValue: BinaryExprValue): boolean {
+    if (
+        tmpValue.opKind === ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken
+    ) {
+        return false;
+    }
+    if (tmpValue.left instanceof BinaryExprValue) {
+        tmpValue = tmpValue.left;
+        return checkSigned(tmpValue);
+    }
+    if (tmpValue.right instanceof BinaryExprValue) {
+        tmpValue = tmpValue.right;
+        return checkSigned(tmpValue);
+    }
+    return true;
+}
+
+function judgeIsInt(value: number) {
+    if (value >= -2147483648 && value < 2147483647 && value % 1 === 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function judgeIsF32(value: number) {
+    if (value >= -8388607 && value < 8388607) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+function checkOverflow(value: LiteralValue, type: ValueType) {
+    if (type.kind === ValueTypeKind.INT) {
+        return judgeIsInt(value.value as number);
+    } else if (type.kind === ValueTypeKind.WASM_F32) {
+        return judgeIsF32(value.value as number);
+    }
+    return true;
+}
+
 export function newCastValue(
     type: ValueType,
     value: SemanticsValue,
@@ -996,10 +1170,7 @@ export function newCastValue(
     else if (type.kind == ValueTypeKind.ENUM)
         type = (type as EnumType).memberType;
 
-    let value_type = value.effectType;
-    if (value_type.kind == ValueTypeKind.ENUM) {
-        value_type = (value_type as EnumType).memberType;
-    }
+    const value_type = value.effectType;
     if (value_type.kind == ValueTypeKind.UNION) {
         if (type.kind == ValueTypeKind.ANY) {
             return new CastValue(
@@ -1049,33 +1220,45 @@ export function newCastValue(
     ) {
         const arr_type = type as ArrayType;
         const arr_value_type = value_type as ArrayType;
-        if (arr_type.element.equals(arr_value_type.element)) return value;
+
+        let arr_element_type = arr_type.element;
+        let value_element_type = arr_value_type.element;
+
+        if (arr_element_type.kind == ValueTypeKind.TYPE_PARAMETER)
+            arr_element_type = (arr_element_type as TypeParameterType).wideType;
+
+        if (value_element_type.kind == ValueTypeKind.TYPE_PARAMETER)
+            value_element_type = (value_element_type as TypeParameterType)
+                .wideType;
+
+        if (arr_element_type.equals(value_element_type)) return value;
 
         if (
-            arr_type.element.kind == ValueTypeKind.ANY &&
-            arr_value_type.element.kind == ValueTypeKind.ANY
+            arr_element_type.kind == ValueTypeKind.ANY &&
+            value_element_type.kind == ValueTypeKind.ANY
         )
             return value;
+
         /* TODO: need to create new CastValue from Array<NUMBER(6)(OBJECT)> to  Array<ANY(10)(OBJECT)> */
         if (
-            isObjectType(arr_type.element.kind) &&
-            isObjectType(arr_value_type.element.kind)
+            isObjectType(arr_element_type.kind) &&
+            isObjectType(value_element_type.kind)
         )
             return value;
         if (
-            (arr_type.element.kind == ValueTypeKind.RAW_STRING ||
-                arr_type.element.kind == ValueTypeKind.STRING) &&
-            (arr_value_type.element.kind == ValueTypeKind.STRING ||
-                arr_value_type.element.kind == ValueTypeKind.RAW_STRING)
+            (arr_element_type.kind == ValueTypeKind.RAW_STRING ||
+                arr_element_type.kind == ValueTypeKind.STRING) &&
+            (value_element_type.kind == ValueTypeKind.STRING ||
+                value_element_type.kind == ValueTypeKind.RAW_STRING)
         )
             return value;
         if (
-            (arr_type.element.kind == ValueTypeKind.NUMBER ||
-                arr_type.element.kind == ValueTypeKind.BOOLEAN ||
-                arr_type.element.kind == ValueTypeKind.INT) &&
-            (arr_value_type.element.kind == ValueTypeKind.NUMBER ||
-                arr_value_type.element.kind == ValueTypeKind.BOOLEAN ||
-                arr_value_type.element.kind == ValueTypeKind.INT)
+            (arr_element_type.kind == ValueTypeKind.NUMBER ||
+                arr_element_type.kind == ValueTypeKind.BOOLEAN ||
+                arr_element_type.kind == ValueTypeKind.INT) &&
+            (value_element_type.kind == ValueTypeKind.NUMBER ||
+                value_element_type.kind == ValueTypeKind.BOOLEAN ||
+                value_element_type.kind == ValueTypeKind.INT)
         )
             return value;
 
@@ -1131,20 +1314,44 @@ export function newCastValue(
         return new CastValue(SemanticsValueKind.VALUE_CAST_VALUE, type, value);
     }
 
-    if (type.kind == ValueTypeKind.INT || type.kind == ValueTypeKind.NUMBER) {
+    if (
+        type.kind == ValueTypeKind.INT ||
+        type.kind == ValueTypeKind.NUMBER ||
+        type.kind == ValueTypeKind.WASM_I64 ||
+        type.kind == ValueTypeKind.WASM_F32
+    ) {
         if (
             value_type.kind == ValueTypeKind.NUMBER ||
             value_type.kind == ValueTypeKind.INT ||
             value_type.kind == ValueTypeKind.BOOLEAN ||
             value_type.kind == ValueTypeKind.STRING ||
             value_type.kind == ValueTypeKind.RAW_STRING ||
+            value_type.kind == ValueTypeKind.ENUM ||
+            value_type.kind == ValueTypeKind.WASM_I64 ||
+            value_type.kind == ValueTypeKind.WASM_F32 ||
             isNullValueType(value_type.kind)
         )
-            return new CastValue(
-                SemanticsValueKind.VALUE_CAST_VALUE,
-                type,
-                value,
-            );
+            if (
+                value instanceof LiteralValue &&
+                value.type.kind === ValueTypeKind.NUMBER &&
+                checkOverflow(value, type)
+            ) {
+                value.type = type;
+                return value;
+            } else {
+                let isSigned = true;
+                const tmpValue = value;
+                if (tmpValue instanceof BinaryExprValue) {
+                    isSigned = checkSigned(tmpValue);
+                }
+                const castedValue = new CastValue(
+                    SemanticsValueKind.VALUE_CAST_VALUE,
+                    type,
+                    value,
+                );
+                castedValue.isSigned = isSigned;
+                return castedValue;
+            }
         if (value_type.kind == ValueTypeKind.ANY)
             return new CastValue(
                 SemanticsValueKind.ANY_CAST_VALUE,
@@ -1219,12 +1426,36 @@ export function newCastValue(
             from_value instanceof NewLiteralObjectValue &&
             to_meta.members.length > from_obj_type.meta.members.length
         ) {
+            /* reorder the order of r-value initialization values according to the shape of the l-value
+             *
+             * e.g.
+             *  interface Node {
+             *      x?: number;
+             *      y?: string;
+             *      z?: boolean;
+             *  }
+             *  const n: Node = {z: true, x: 10};
+             *
+             * reorder initValues from '{z: true, x: 10}' to '{x: 10, y: undefined, z: true}'
+             */
+            const initValues: SemanticsValue[] = [];
             for (const to_member of to_meta.members) {
                 if (
                     from_obj_type.meta.members.find((from_member) => {
                         return from_member.name === to_member.name;
                     })
                 ) {
+                    const from_member = from_obj_type.meta.findMember(
+                        to_member.name,
+                    )!;
+                    const v = (from_value as NewLiteralObjectValue).initValues[
+                        from_member.index
+                    ];
+                    if (!from_member.valueType.equals(to_member.valueType)) {
+                        initValues.push(newCastValue(to_member.valueType, v));
+                    } else {
+                        initValues.push(v);
+                    }
                     continue;
                 }
                 if (
@@ -1233,22 +1464,16 @@ export function newCastValue(
                         Primitive.Undefined,
                     )
                 ) {
-                    (from_value as NewLiteralObjectValue).initValues.push(
+                    initValues.push(
                         new LiteralValue(Primitive.Undefined, undefined),
-                    );
-                    const curLen = (from_value.type as ObjectType).meta.members
-                        .length;
-                    (from_value.type as ObjectType).meta.members.push(
-                        new MemberDescription(
-                            to_member.name,
-                            to_member.type,
-                            curLen,
-                            to_member.isOptional,
-                            to_member.valueType,
-                        ),
                     );
                 }
             }
+
+            // when the 'meta' of r-value is modified, the 'typeId' of r-value also needs to be modified.
+            from_value.initValues = initValues;
+            (from_value.type as ObjectType).meta.members = to_meta.members;
+            from_value.type.typeId = type.typeId;
         }
 
         if (from_shape && from_shape.isStaticShape()) {
@@ -1276,20 +1501,73 @@ export function newCastValue(
         return value;
     }
 
+    if (
+        type.kind === ValueTypeKind.GENERIC &&
+        value_type.kind !== ValueTypeKind.GENERIC
+    ) {
+        /* no cast is required from other types to generic type */
+        return value;
+    }
+
     throw Error(`cannot make cast value from "${value_type}" to  "${type}"`);
 }
 
-function typeUp(up: ValueType, down: ValueType): boolean {
+function typeUp(upValue: SemanticsValue, downValue: SemanticsValue): boolean {
+    const up = upValue.type;
+    const down = downValue.type;
+
     if (down.kind == ValueTypeKind.ANY) return true;
 
-    if (
-        up.kind == ValueTypeKind.NUMBER &&
-        (down.kind == ValueTypeKind.INT || down.kind == ValueTypeKind.BOOLEAN)
-    )
-        return true;
+    if (up.kind == ValueTypeKind.NUMBER) {
+        if (
+            down.kind === ValueTypeKind.WASM_F32 ||
+            down.kind == ValueTypeKind.WASM_I64 ||
+            down.kind == ValueTypeKind.INT ||
+            down.kind === ValueTypeKind.BOOLEAN
+        ) {
+            return true;
+        }
+    }
 
-    if (up.kind == ValueTypeKind.INT && down.kind == ValueTypeKind.BOOLEAN)
-        return true;
+    if (up.kind === ValueTypeKind.INT) {
+        if (down.kind == ValueTypeKind.BOOLEAN) {
+            return true;
+        }
+        if (
+            downValue instanceof LiteralValue &&
+            typeof downValue.value === 'number'
+        ) {
+            return judgeIsInt(downValue.value as number);
+        }
+        // TODO: check if upValue's value is integer, if true, return true
+    }
+
+    if (up.kind === ValueTypeKind.WASM_I64) {
+        if (
+            down.kind == ValueTypeKind.BOOLEAN ||
+            down.kind == ValueTypeKind.INT
+        ) {
+            return true;
+        }
+        if (
+            downValue instanceof LiteralValue &&
+            typeof downValue.value === 'number' &&
+            (downValue.value as number) % 1 === 0
+        ) {
+            return true;
+        }
+        // TODO: check if upValue's value is integer, if true, return true
+    }
+
+    if (up.kind == ValueTypeKind.WASM_F32) {
+        if (
+            down.kind == ValueTypeKind.BOOLEAN ||
+            down.kind == ValueTypeKind.WASM_I64 ||
+            down.kind == ValueTypeKind.INT
+        ) {
+            return true;
+        }
+    }
 
     if (up.kind == ValueTypeKind.STRING || up.kind == ValueTypeKind.RAW_STRING)
         return true;
@@ -1305,24 +1583,58 @@ function typeUp(up: ValueType, down: ValueType): boolean {
     return false;
 }
 
-function typeTranslate(type1: ValueType, type2: ValueType): ValueType {
+function needTranslated(value1: SemanticsValue, value2: SemanticsValue) {
+    const type1 = value1.effectType;
+    const type2 = value2.effectType;
+    if (type1.kind === ValueTypeKind.ANY || type2.kind === ValueTypeKind.ANY) {
+        return false;
+    }
+    if (type1.isWASM || type2.isWASM) {
+        return true;
+    }
+    return false;
+}
+
+function typeTranslate(
+    value1: SemanticsValue,
+    value2: SemanticsValue,
+): ValueType {
+    const type1 = value1.effectType;
+    const type2 = value2.effectType;
+
     if (type1.equals(type2)) return type1;
 
-    if (typeUp(type1, type2)) return type1;
+    if (typeUp(value1, value2)) return type1;
 
-    if (typeUp(type2, type1)) return type2;
+    if (typeUp(value2, value1)) return type2;
 
     throw Error(`"${type1}" aginst of "${type2}"`);
 }
 
-export function shapeAssignCheck(left: ValueType, right: ValueType) {
+export function shapeAssignCheck(left: ValueType, right: ValueType): boolean {
     // iff the type of lvalue is 'any', we should never fix its shape.
     if (left.equals(Primitive.Any)) return false;
+
+    /* e.g.
+     *  interface I {
+     *      x: string[]
+     *  }
+     *
+     *  const i: I =  { x: [] }
+     */
+    if (left instanceof ArrayType && right instanceof ArrayType) {
+        if (
+            left.element.kind !== ValueTypeKind.ANY &&
+            right.element.kind == ValueTypeKind.ANY
+        )
+            return false;
+    }
 
     if (
         left.kind == ValueTypeKind.OBJECT &&
         right.kind == ValueTypeKind.OBJECT
     ) {
+        if (left.equals(right)) return true;
         const leftMeta = (left as ObjectType).meta;
         const rightMeta = (right as ObjectType).meta;
         if (rightMeta.members.length >= leftMeta.members.length) {
@@ -1361,6 +1673,15 @@ export function shapeAssignCheck(left: ValueType, right: ValueType) {
                     !(right_member.valueType instanceof UnionType)
                 ) {
                     return false;
+                }
+                if (
+                    left_member.valueType instanceof ObjectType &&
+                    right_member.valueType instanceof ObjectType
+                ) {
+                    return shapeAssignCheck(
+                        left_member.valueType,
+                        right_member.valueType,
+                    );
                 }
             }
         } else {
@@ -1408,9 +1729,30 @@ export function newBinaryExprValue(
            And if the type of lvalue and rvalue are both primitive types,
            there is no need to convert the type of lvalue and the type of rvalue to "any".
         */
-        if (!left_value.type.isPrimitive || !right_value.type.isPrimitive) {
+        if (left_value.type.kind == ValueTypeKind.ENUM) {
+            const enum_type = left_value.type as EnumType;
+            left_value = newCastValue(enum_type.memberType, left_value);
+        }
+        if (right_value.type.kind == ValueTypeKind.ENUM) {
+            const enum_type = right_value.type as EnumType;
+            right_value = newCastValue(enum_type.memberType, right_value);
+        }
+        if (
+            !(
+                (left_value.type.isPrimitive || left_value.type.isWASM) &&
+                (right_value.type.isPrimitive || right_value.type.isWASM)
+            )
+        ) {
             left_value = newCastValue(Primitive.Any, left_value);
             right_value = newCastValue(Primitive.Any, right_value);
+        } else {
+            if (needTranslated(left_value, right_value)) {
+                const target_type = typeTranslate(left_value, right_value);
+                if (!target_type.equals(left_value.effectType))
+                    left_value = newCastValue(target_type, left_value);
+                if (!target_type.equals(right_value.effectType))
+                    right_value = newCastValue(target_type, right_value);
+            }
         }
     } else if (
         left_value.type.isSpecialized() &&
@@ -1425,12 +1767,42 @@ export function newBinaryExprValue(
     } else if (!left_value.effectType.equals(right_value.effectType)) {
         if (is_equal) {
             if (
+                left_value.effectType instanceof ObjectType &&
+                right_value instanceof NewLiteralObjectValue
+            ) {
+                const l_meta = left_value.effectType.meta;
+                const r_meta = right_value.objectType.meta;
+                for (
+                    let index = 0;
+                    index < right_value.initValues.length;
+                    index++
+                ) {
+                    const v = right_value.initValues[index];
+                    if (v instanceof NewArrayLenValue) {
+                        const r_member = r_meta.members[index];
+                        const l_member = l_meta.findMember(r_member.name);
+                        if (
+                            l_member &&
+                            l_member.valueType.kind == ValueTypeKind.ARRAY
+                        ) {
+                            v.type = l_member.valueType;
+                            r_member.valueType = l_member.valueType;
+                        }
+                    }
+                }
+            }
+            if (
                 right_value instanceof NewArrayLenValue &&
                 left_value.type.kind === ValueTypeKind.ARRAY
             ) {
                 /* For NewArrayLenValue with zero length,
                     update the array type according to the assign target */
                 right_value.type = left_value.type;
+            } else if (
+                left_value.effectType instanceof WASMArrayType &&
+                right_value.type instanceof ArrayType
+            ) {
+                /* In this situation, we want to create a raw wasm array, no need to cast */
             } else {
                 right_value = newCastValue(left_value.effectType, right_value);
                 if (isMemberSetValue(left_value)) {
@@ -1438,10 +1810,7 @@ export function newBinaryExprValue(
                 }
             }
         } else if (opKind !== ts.SyntaxKind.InstanceOfKeyword) {
-            const target_type = typeTranslate(
-                left_value.effectType,
-                right_value.effectType,
-            );
+            const target_type = typeTranslate(left_value, right_value);
             if (!target_type.equals(left_value.effectType))
                 left_value = newCastValue(target_type, left_value);
             if (!target_type.equals(right_value.effectType))
@@ -1482,7 +1851,9 @@ function isMemberSetValue(v: SemanticsValue): boolean {
         v.kind == SemanticsValueKind.STRING_INDEX_SET ||
         v.kind == SemanticsValueKind.ARRAY_INDEX_SET ||
         v.kind == SemanticsValueKind.OBJECT_INDEX_SET ||
-        v.kind == SemanticsValueKind.OBJECT_KEY_SET
+        v.kind == SemanticsValueKind.OBJECT_KEY_SET ||
+        v.kind == SemanticsValueKind.WASMARRAY_INDEX_SET ||
+        v.kind == SemanticsValueKind.WASMSTRUCT_INDEX_SET
     );
 }
 
@@ -1580,6 +1951,18 @@ function buildBinaryExpression(
     }
     right_value.incAccessCount();
     context.popReference();
+
+    if (is_equal && expr.leftOperand instanceof PropertyAccessExpression) {
+        const properexpr = expr.leftOperand as PropertyAccessExpression;
+        if (
+            properexpr.propertyAccessExpr.exprType.kind == TypeKind.ARRAY &&
+            properexpr.propertyExpr instanceof IdentifierExpression &&
+            properexpr.propertyExpr.identifierName == 'length'
+        ) {
+            left_value.type = Primitive.Int;
+            right_value.type = Primitive.Int;
+        }
+    }
 
     return newBinaryExprValue(
         undefined,
@@ -1758,6 +2141,16 @@ class GuessTypeArguments {
             return;
         }
 
+        if (templateType.kind == ValueTypeKind.UNION) {
+            const unionType = templateType as UnionType;
+            unionType.types.forEach((t) => {
+                if (t.kind == ValueTypeKind.TYPE_PARAMETER) {
+                    this.updateTypeMap(t as TypeParameterType, valueType);
+                }
+            });
+            return;
+        }
+
         if (valueType.kind != templateType.kind) {
             throw Error(
                 `Cannot guess the value type: template: ${templateType}, valueType: ${valueType}`,
@@ -1779,9 +2172,6 @@ class GuessTypeArguments {
                     valueType as FunctionType,
                 );
                 break;
-
-            case ValueTypeKind.UNION:
-                break; // TODO
         }
     }
 
@@ -1981,7 +2371,6 @@ function buildCallExpression(
             func_type,
             specialTypeArgs,
         ) as FunctionType;
-        func_type.setSpecialTypeArguments(specialTypeArgs);
         (func as FunctionCallBaseValue).funcType = func_type;
     }
 
@@ -2001,6 +2390,18 @@ function buildCallExpression(
     func.type = func_type.returnType; // reset the func type
     func.shape = GetShapeFromType(func.type);
     return func;
+}
+
+function buildEnumerateKeysExpr(
+    expr: EnumerateKeysExpression,
+    context: BuildContext,
+) {
+    const valueType = context.findValueTypeByKey(expr.exprType)!;
+    context.pushReference(ValueReferenceKind.RIGHT);
+    const obj = buildExpression(expr.targetObj, context);
+    context.popReference();
+
+    return new EnumerateKeysGetValue(valueType, obj);
 }
 
 function buildNewExpression2(
@@ -2034,8 +2435,9 @@ function buildNewExpression2(
         } else {
             const exprObjType = context.module.findValueTypeByType(
                 expr.exprType,
-            ) as ObjectType;
+            )! as ObjectType;
             if (
+                exprObjType &&
                 exprObjType.genericOwner &&
                 exprObjType.genericType.equals(object_type)
             ) {
@@ -2046,19 +2448,26 @@ function buildNewExpression2(
     }
     const clazz_type = object_type.classType;
 
+    let obj_type: WASMArrayType | ArrayType;
+    if (expr.exprType instanceof WasmArrayType) {
+        obj_type = createType(context, expr.exprType) as WASMArrayType;
+    } else {
+        obj_type = object_type as ArrayType;
+    }
+
     if (clazz_type && clazz_type.kind == ValueTypeKind.ARRAY) {
         if (expr.lenExpr != null) {
             const lenExpr = buildExpression(expr.lenExpr!, context);
-            const object_value = new NewArrayLenValue(
-                object_type as ArrayType,
-                lenExpr,
-            );
-            if (valueTypeArgs) object_value.setTypeArguments(valueTypeArgs);
+            const object_value = new NewArrayLenValue(obj_type, lenExpr);
+            if (valueTypeArgs)
+                (<NewArrayLenValue>object_value).setTypeArguments(
+                    valueTypeArgs,
+                );
             return object_value;
         } else {
             return buildNewArrayParameters(
                 context,
-                object_type as ArrayType,
+                obj_type,
                 expr.newArgs,
                 valueTypeArgs,
             );
@@ -2126,7 +2535,7 @@ function buildNewClass(
 
 function buildNewArrayParameters(
     context: BuildContext,
-    arr_type: ArrayType,
+    arr_type: ArrayType | WASMArrayType,
     params: Expression[] | undefined,
     valueTypeArgs: ValueType[] | undefined,
 ): SemanticsValue {
@@ -2140,8 +2549,15 @@ function buildNewArrayParameters(
     if (params && params && params.length > 0) {
         for (const p of params) {
             context.pushReference(ValueReferenceKind.RIGHT);
-            const v = buildExpression(p, context);
+            let v = buildExpression(p, context);
             context.popReference();
+            const elem_type =
+                arr_type instanceof ArrayType
+                    ? arr_type.element
+                    : (<WASMArrayType>arr_type).arrayType.element;
+            if (v.type !== elem_type) {
+                v = newCastValue(elem_type, v);
+            }
             param_values.push(v);
             if (init_types) {
                 init_types.add(v.type);
@@ -2149,22 +2565,32 @@ function buildNewArrayParameters(
         }
     }
 
-    if (init_types) {
-        arr_type = createArrayType(
-            context,
-            CreateWideTypeFromTypes(context, init_types),
+    let arr_value: SemanticsValue;
+    if (arr_type instanceof ArrayType) {
+        if (init_types) {
+            arr_type = createArrayType(
+                context,
+                CreateWideTypeFromTypes(context, init_types),
+            );
+        }
+
+        if (!arr_type.isSpecialized()) {
+            arr_type = GetPredefinedType(
+                PredefinedTypeId.ARRAY_ANY,
+            )! as ArrayType;
+        }
+
+        arr_value = new NewArrayValue(
+            (<ArrayType>arr_type).instanceType! as ArrayType,
+            param_values,
         );
+        if (valueTypeArgs) {
+            (<NewArrayValue>arr_value).setTypeArguments(valueTypeArgs);
+        }
+    } else {
+        arr_value = new NewArrayValue(arr_type as WASMArrayType, param_values);
     }
 
-    if (!arr_type.isSpecialized()) {
-        arr_type = GetPredefinedType(PredefinedTypeId.ARRAY_ANY)! as ArrayType;
-    }
-
-    const arr_value = new NewArrayValue(
-        arr_type.instanceType! as ArrayType,
-        param_values,
-    );
-    if (valueTypeArgs) arr_value.setTypeArguments(valueTypeArgs);
     return arr_value;
 }
 
@@ -2273,11 +2699,36 @@ function buildElementAccessExpression(
                     ? SemanticsValueKind.OBJECT_INDEX_SET
                     : SemanticsValueKind.OBJECT_INDEX_GET;
             }
+        } else if (type.kind === ValueTypeKind.TUPLE) {
+            element_type = is_set
+                ? SemanticsValueKind.TUPLE_INDEX_SET
+                : SemanticsValueKind.TUPLE_INDEX_GET;
+            if (arg instanceof LiteralValue) {
+                const index = arg.value as number;
+                value_type = (type as TupleType).elements[index];
+            }
+        } else if (type.kind === ValueTypeKind.WASM_ARRAY) {
+            element_type = is_set
+                ? SemanticsValueKind.WASMARRAY_INDEX_SET
+                : SemanticsValueKind.WASMARRAY_INDEX_GET;
+            value_type = (type as WASMArrayType).arrayType.element;
+        } else if (type.kind === ValueTypeKind.WASM_STRUCT) {
+            element_type = is_set
+                ? SemanticsValueKind.WASMSTRUCT_INDEX_SET
+                : SemanticsValueKind.WASMSTRUCT_INDEX_GET;
+            if (arg instanceof LiteralValue) {
+                const index = arg.value as number;
+                value_type = (type as WASMStructType).tupleType.elements[index];
+            }
         }
     } else {
         if (type.kind == ValueTypeKind.OBJECT) {
             const obj_type = type as ObjectType;
-            if (obj_type.stringIndexType) value_type = obj_type.stringIndexType;
+            if (obj_type.stringIndexType) {
+                value_type = obj_type.stringIndexType;
+            } else {
+                value_type = createType(context, expr.exprType);
+            }
         }
     }
 
@@ -2513,10 +2964,15 @@ export function buildExpression(
     try {
         switch (expr.expressionKind) {
             case ts.SyntaxKind.PropertyAccessExpression:
-                res = buildPropertyAccessExpression(
-                    expr as PropertyAccessExpression,
-                    context,
-                );
+                // EnumerateKeysExpression and PropertyAccessExpression has the same type kind
+                if (expr instanceof EnumerateKeysExpression) {
+                    res = buildEnumerateKeysExpr(expr, context);
+                } else {
+                    res = buildPropertyAccessExpression(
+                        expr as PropertyAccessExpression,
+                        context,
+                    );
+                }
                 break;
             case ts.SyntaxKind.Identifier:
                 res = buildIdentiferExpression(

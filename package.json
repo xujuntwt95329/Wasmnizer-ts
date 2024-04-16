@@ -1,5 +1,5 @@
 {
-  "name": "ts2wasm",
+  "name": "Wasmnizer-ts",
   "version": "0.0.1",
   "description": "",
   "main": "index.js",
@@ -21,17 +21,16 @@
     "setup-hooks": "node scripts/link_hooks.js",
     "build": "npx tsc && npm run build:lib",
     "release": "npx tsc -p tsconfig.release.json && npm run build:lib",
-    "build:lib": "cp -r ./lib/builtin/* ./build/lib/builtin/ && mkdir -p ./build/src/backend/binaryen/lib/interface && cp -r ./src/backend/binaryen/lib/interface/* ./build/src/backend/binaryen/lib/interface"
+    "build:lib": "node scripts/copy_lib_files.js build"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/wasm-micro-runtime/ts2wasm.git"
+    "url": "git+https://github.com/intel/Wasmnizer-ts.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "binaryen": "^114.0.0-nightly.20230725",
     "log4js": "^6.8.0",
     "long": "^5.2.1",
     "ts-node": "^10.9.1",
@@ -46,6 +45,7 @@
     "@typescript-eslint/eslint-plugin": "^5.33.1",
     "@typescript-eslint/parser": "^5.33.1",
     "@typescript-eslint/utils": "^5.33.0",
+    "binaryen": "^116.0.0",
     "c8": "^7.12.0",
     "chai": "^4.3.6",
     "eslint": "^8.22.0",
@@ -64,12 +64,12 @@
   },
   "lint-staged": {
     "*.ts": [
-      "eslint --ignore-path .eslintignore --config .eslintrc.json --fix '**/*.ts'",
+      "eslint --ignore-path .eslintignore --config .eslintrc.json --fix --quiet '**/*.ts'",
       "prettier --ignore-path .prettierignore --config .prettierrc.json --write '**/*.ts'"
     ]
   },
   "bugs": {
-    "url": "https://github.com/wasm-micro-runtime/ts2wasm/issues"
+    "url": "https://github.com/intel/Wasmnizer-ts/issues"
   },
-  "homepage": "https://github.com/wasm-micro-runtime/ts2wasm#readme"
+  "homepage": "https://github.com/intel/Wasmnizer-ts#readme"
 }

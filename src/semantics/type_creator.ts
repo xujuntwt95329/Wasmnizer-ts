@@ -6,8 +6,6 @@
 import {
     Type,
     TSClass,
-    TsClassField,
-    TsClassFunc,
     FunctionKind,
     TypeKind,
     TSFunction,
@@ -17,6 +15,9 @@ import {
     TSEnum,
     TSContext,
     TSTypeWithArguments,
+    WasmArrayType,
+    TSTuple,
+    WasmStructType,
 } from '../type.js';
 
 import { InternalNames } from './internal.js';
@@ -47,6 +48,9 @@ import {
     ObjectTypeFlag,
     ClosureContextType,
     ValueTypeWithArguments,
+    WASMArrayType,
+    TupleType,
+    WASMStructType,
 } from './value_types.js';
 
 import { BuildContext } from './builder_context.js';
@@ -71,6 +75,7 @@ import {
 } from './runtime.js';
 import { buildExpression, newCastValue } from './expression_builder.js';
 import { DefaultTypeId } from '../utils.js';
+import { BuiltinNames } from '../../lib/builtin/builtin_name.js';
 
 export function isObjectType(kind: ValueTypeKind): boolean {
     return (
@@ -99,6 +104,17 @@ export function createArrayType(
     const array_type = context.module.findArrayValueType(element_type);
     if (array_type) return array_type as ArrayType;
     return specializeBuiltinObjectType('Array', [element_type])! as ArrayType;
+}
+
+export function createTupleType(
+    context: BuildContext,
+    element_types: ValueType[],
+): TupleType {
+    const tuple_type = context.module.findTupleElementTypes(element_types);
+    if (tuple_type) {
+        return tuple_type as TupleType;
+    }
+    return new TupleType(context.nextTypeId(), element_types);
 }
 
 function createTypeScores(): Map<ValueTypeKind, number> {
@@ -215,7 +231,7 @@ function collectWideTypes(types: Set<ValueType>): ValueType[] {
         return [wideType];
     }
 
-    return objectTypes;
+    return [Primitive.Any];
 }
 
 function createUnionInterfaceType(
@@ -349,7 +365,6 @@ export function createType(
                 context.nextTypeId(),
                 retType,
                 params,
-                func.envParamLen,
                 func.isOptionalParams,
                 func.restParamIdx,
             );
@@ -391,6 +406,19 @@ export function createType(
             value_type = enum_type;
             break;
         }
+        case TypeKind.TUPLE: {
+            const tsTuple = type as TSTuple;
+            const tuple_elements: ValueType[] = [];
+            for (const element_type of tsTuple.elements) {
+                tuple_elements.push(createType(context, element_type));
+            }
+            const tuple_type = new TupleType(
+                context.nextTypeId(),
+                tuple_elements,
+            );
+            value_type = tuple_type;
+            break;
+        }
         case TypeKind.CONTEXT: {
             const contextType = type as TSContext;
             const parentCtxType = contextType.parentCtxType
@@ -404,6 +432,40 @@ export function createType(
                 freeVarTypeList.push(createType(context, t));
             }
             value_type = new ClosureContextType(parentCtxType, freeVarTypeList);
+            break;
+        }
+        case TypeKind.WASM_ARRAY: {
+            const wasmArrayType = type as WasmArrayType;
+            const arrayValueType = createType(
+                context,
+                wasmArrayType.arrayType,
+            ) as ArrayType;
+            value_type = new WASMArrayType(
+                arrayValueType,
+                wasmArrayType.packedTypeKind,
+                wasmArrayType.mutability,
+                wasmArrayType.nullability,
+            );
+            break;
+        }
+        case TypeKind.WASM_STRUCT: {
+            const wasmStructType = type as WasmStructType;
+            const structValueType = createType(
+                context,
+                wasmStructType.tupleType,
+            ) as TupleType;
+            value_type = new WASMStructType(
+                structValueType,
+                wasmStructType.packedTypeKinds,
+                wasmStructType.mutabilitys,
+                wasmStructType.nullability,
+                wasmStructType.baseType
+                    ? (createType(
+                          context,
+                          wasmStructType.baseType,
+                      ) as WASMStructType)
+                    : undefined,
+            );
             break;
         }
     }
@@ -431,6 +493,23 @@ export function createType(
     return value_type!;
 }
 
+function handleRecType(
+    context: BuildContext,
+    clazz: TSClass,
+    inst_type: ObjectType,
+) {
+    /** the frontend will only generate single tsclass for object type, so here we can determine whether the type is
+     * belong to rec group
+     */
+    for (let i = 0; i < context.recClassTypeGroup.length; ++i) {
+        const row = context.recClassTypeGroup[i];
+        const col = row.indexOf(clazz);
+        if (col !== -1) {
+            context.module.recObjectTypeGroup[i][col] = inst_type;
+        }
+    }
+}
+
 export function createObjectType(
     clazz: TSClass,
     context: BuildContext,
@@ -439,8 +518,18 @@ export function createObjectType(
     if (objectType) {
         return objectType as ObjectType;
     }
-    if (IsBuiltinObject(clazz.className)) {
-        return createBuiltinObjectType(clazz, context);
+    // filter out useless class types
+    if (
+        clazz.typeKind == TypeKind.CLASS &&
+        !clazz.isLiteral &&
+        !clazz.belongedScope
+    ) {
+        return undefined;
+    }
+    if (clazz.mangledName.includes(BuiltinNames.builtinTypeManglePrefix)) {
+        if (IsBuiltinObject(clazz.className)) {
+            return createBuiltinObjectType(clazz, context);
+        }
     }
     let mangledName = clazz.mangledName;
     if (mangledName.length == 0) mangledName = clazz.className;
@@ -476,6 +565,7 @@ export function createObjectType(
         inst_meta,
         clazz.isLiteral ? ObjectTypeFlag.LITERAL : ObjectTypeFlag.OBJECT,
     );
+    context.metaAndObjectTypeMap.set(inst_meta, inst_type);
     inst_type.implId = DefaultTypeId;
     if (impl_infc) {
         inst_type.implId = impl_infc.typeId;
@@ -496,7 +586,9 @@ export function createObjectType(
         genericOwner = context.module.findValueTypeByType(
             clazz.genericOwner,
         ) as ObjectType;
-        inst_type.setGenericOwner(genericOwner.instanceType!);
+        if (genericOwner) {
+            inst_type.setGenericOwner(genericOwner.instanceType!);
+        }
     }
 
     if (inst_meta.isObjectInstance) {
@@ -519,6 +611,7 @@ export function createObjectType(
             clazz_meta,
             ObjectTypeFlag.CLASS,
         );
+        context.metaAndObjectTypeMap.set(clazz_meta, clazz_type);
         clazz_type.implId = inst_type.implId;
 
         clazz_type.instanceType = inst_type;
@@ -545,16 +638,7 @@ export function createObjectType(
     context.pushTask(() =>
         updateMemberDescriptions(context, clazz, inst_meta, clazz_meta),
     );
-    /** the frontend will only generate single tsclass for object type, so here we can determine whether the type is
-     * belong to rec group
-     */
-    for (let i = 0; i < context.recClassTypeGroup.length; ++i) {
-        const row = context.recClassTypeGroup[i];
-        const col = row.indexOf(clazz);
-        if (col !== -1) {
-            context.module.recObjectTypeGroup[i][col] = inst_type;
-        }
-    }
+    handleRecType(context, clazz, inst_type);
     return inst_type;
 }
 
@@ -570,23 +654,29 @@ function createBuiltinObjectType(
         context.setNamedValueType(obj_type.meta.name, obj_type);
 
     if (clazz.typeKind == TypeKind.INTERFACE || clazz.isLiteral)
-        updateMemberDescriptions(
-            context,
-            clazz,
-            obj_type.meta,
-            undefined,
-            false,
+        context.pushTask(() =>
+            updateMemberDescriptions(
+                context,
+                clazz,
+                obj_type.meta,
+                undefined,
+                false,
+            ),
         );
     else
-        updateMemberDescriptions(
-            context,
-            clazz,
-            obj_type.instanceType!.meta,
-            obj_type.classType!.meta,
-            false,
+        context.pushTask(() =>
+            updateMemberDescriptions(
+                context,
+                clazz,
+                obj_type.instanceType!.meta,
+                obj_type.classType!.meta,
+                false,
+            ),
         );
 
     context.objectDescriptions.set(obj_type.meta.name, obj_type.meta);
+
+    handleRecType(context, clazz, obj_type);
 
     return obj_type;
 }
@@ -823,7 +913,6 @@ function updateMemberDescriptions(
         ) {
             const is_setter = m.type.funcKind == FunctionKind.SETTER;
             const name = `${is_setter ? 'set_' : 'get_'}${m.name}`;
-            const key = is_setter ? 'setter' : 'getter';
             const globalName = is_interface
                 ? `${clazz.className}|${name}`
                 : `${clazz.mangledName}|${name}`;
@@ -859,8 +948,40 @@ function updateMemberDescriptions(
                     accessor.valueType = field_type;
                 }
             }
+            if (is_setter) {
+                accessor.setterType = field_type;
+            } else {
+                accessor.getterType = field_type;
+            }
 
-            if (func) accessor.setAccessorFunction(func, is_setter);
+            if (func) {
+                accessor.setAccessorFunction(func, is_setter);
+            } else {
+                // when 'func' is empty, it means that the current getter/setter is inherited from the base class
+                if (!is_interface) {
+                    let baseClass = clazz.getBase();
+                    while (baseClass) {
+                        const globalMethodName = `${baseClass.mangledName}|${name}`;
+                        const funcValue = getGlobalFunction(
+                            context,
+                            globalMethodName,
+                        );
+                        if (funcValue) {
+                            if (
+                                (is_setter && !accessor.hasSetter) ||
+                                (!is_setter && !accessor.hasGetter)
+                            ) {
+                                accessor.setAccessorFunction(
+                                    funcValue,
+                                    is_setter,
+                                );
+                            }
+                            break;
+                        }
+                        baseClass = baseClass.getBase();
+                    }
+                }
+            }
             if (!is_instance) {
                 if (is_setter) accessor.setterOffset = inst_offset;
                 else accessor.getterOffset = inst_offset;
@@ -1337,7 +1458,6 @@ export class SpecializeTypeMapper {
                         -1,
                         ret_type,
                         args,
-                        func_type.envParamLen,
                         func_type.isOptionalParams,
                         func_type.restParamIdx,
                     );

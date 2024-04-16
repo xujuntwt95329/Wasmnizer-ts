@@ -24,7 +24,7 @@ import { Type, TypeKind, TSClass } from '../type.js';
 
 import { SemanticsValue, SemanticsValueKind, VarValue } from './value.js';
 
-import { ValueType } from './value_types.js';
+import { ObjectType, ValueType } from './value_types.js';
 
 import {
     SemanticsNode,
@@ -93,6 +93,8 @@ export class BuildContext {
     public enterScope: GlobalScope | undefined = undefined;
     public startStmts = new Map<GlobalScope, SemanticsNode[]>();
     public recClassTypeGroup = new Array<TSClass[]>();
+    // record objectDescription and corresponding objectType
+    public metaAndObjectTypeMap = new Map<ObjectDescription, ObjectType>();
 
     addFunctionValue(var_func: VarValue) {
         this.namedGlobalValues.set(var_func.index as string, var_func);
@@ -258,6 +260,10 @@ export class BuildContext {
         return this.findSymbol(id, importSearchTypes.Function);
     }
 
+    findClass(id: string): SymbolValue | undefined {
+        return this.findSymbol(id, importSearchTypes.Class);
+    }
+
     findNamespace(id: string): SymbolValue | undefined {
         return this.findSymbol(id, importSearchTypes.Namespace);
     }
@@ -331,13 +337,8 @@ export class BuildContext {
         const var_decl = value.ref as VarDeclareNode;
         var_decl.setUsedByClosureFunction();
 
-        /* The found varDeclareNode needs a deep copy, since the arribute is different between various scopes */
-        const new_var_decl = var_decl.copy();
-        new_var_decl.setUsedByClosureFunction();
-
-        new_var_decl.curCtx = curFunc.varList![0];
-        const newValue = value.copy();
-        newValue.ref = new_var_decl;
+        let new_var_decl = var_decl;
+        let newValue = value;
 
         ownScope = ownScope.getRootFunctionScope()!;
         for (let i = env_idx + 1; i < this.stackEnv.length; i++) {
@@ -345,6 +346,12 @@ export class BuildContext {
             if (env.function) {
                 /* Closure variables can only be used within the same rootFunction */
                 if (env.scope.getRootFunctionScope()! === ownScope) {
+                    /* The found varDeclareNode needs a deep copy, since the arribute is different between various scopes */
+                    new_var_decl = var_decl.copy();
+                    new_var_decl.setUsedByClosureFunction();
+                    new_var_decl.curCtx = env.function.varList![0];
+                    newValue = value.copy();
+                    newValue.ref = new_var_decl;
                     env.function.pushClosureVarDeclare(new_var_decl);
                     if (!env.closures)
                         env.closures = new Map<SymbolKey, VarValue>();

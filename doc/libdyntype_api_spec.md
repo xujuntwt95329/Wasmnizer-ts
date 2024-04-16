@@ -4,6 +4,8 @@
 
 `libdyntype` is a library for supporting dynamic objects for WebAssembly. It provides APIs for creating, accessing and manipulating dynamic objects. The dynamic objects are represented as `externref` in WebAssembly, the actual memory space is created and managed by external environment.
 
+> Note: in current implementation, we use `anyref` rather than `externref` to avoid `internalize` and `externalize` operations, we will switch to `externref` once we confirm the overhead of `internalize/externalize` is acceptable.
+
 ![](./img/libdyntype_any_object.excalidraw.png)
 
 The dynamic objects managed by `libdyntype` are called `any-object`, it can be divided into two categories:
@@ -136,7 +138,7 @@ These APIs are required by `dynamic types`, the absence of this set of APIs woul
     - **Parameters**
         - `externref`: the dyntype context
         - `i32`: the class name (string)
-        - `arrayref`: rest parameters array
+        - `externref`: rest parameters array
     - **Return**
         - `externref`: the created object
 
@@ -493,7 +495,7 @@ These APIs are required by `dynamic types`, the absence of this set of APIs woul
         - `externref`: the dyntype context
         - `i32`: method name (string)
         - `externref`: the given dynamic object
-        - `arrayref`: the arguments array
+        - `externref`: the arguments array
     - **Return**
         - `externref`: the return value
 
@@ -505,3 +507,12 @@ These APIs are required by `dynamic types`, the absence of this set of APIs woul
         - `i32`: global variable name (string)
     - **Return**
         - `externref`: the global variable
+
+- **dyntype_get_keys**
+    - **Description**
+        - Get the enumerable properties of the given object
+    - **Parameters**
+        - `externref`: the dyntype context
+        - `externref`: the object
+    - **Return**
+        - `externref`: dynamic array which store all property names

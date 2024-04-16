@@ -11,11 +11,11 @@ import { fileURLToPath } from 'url';
 import { UtilFuncs } from '../utils.js';
 import { BuiltinNames } from '../../../../lib/builtin/builtin_name.js';
 import { getBuiltInFuncName } from '../../../utils.js';
-import { charArrayTypeInfo, stringTypeInfo } from '../glue/packType.js';
+import { i8ArrayTypeInfo } from '../glue/packType.js';
 import { _BinaryenTypeStringref } from '../glue/binaryen.js';
-import { getConfig } from '../../../../config/config_mgr.js';
 
 export function importAnyLibAPI(module: binaryen.Module) {
+    dyntype.updateValueByConfig();
     module.addFunctionImport(
         dyntype.dyntype_get_context,
         dyntype.module_name,
@@ -49,9 +49,7 @@ export function importAnyLibAPI(module: binaryen.Module) {
         dyntype.module_name,
         dyntype.dyntype_typeof,
         binaryen.createType([dyntype.dyn_ctx_t, dyntype.dyn_value_t]),
-        getConfig().enableStringRef
-            ? _BinaryenTypeStringref()
-            : stringTypeInfo.typeRef,
+        dyntype.ts_string,
     );
     module.addFunctionImport(
         dyntype.dyntype_typeof1,
@@ -65,9 +63,7 @@ export function importAnyLibAPI(module: binaryen.Module) {
         dyntype.module_name,
         dyntype.dyntype_toString,
         binaryen.createType([dyntype.dyn_ctx_t, dyntype.dyn_value_t]),
-        getConfig().enableStringRef
-            ? _BinaryenTypeStringref()
-            : stringTypeInfo.typeRef,
+        dyntype.ts_string,
     );
     module.addFunctionImport(
         dyntype.dyntype_type_eq,
@@ -223,6 +219,13 @@ export function importAnyLibAPI(module: binaryen.Module) {
         dyntype.int,
     );
     module.addFunctionImport(
+        dyntype.dyntype_get_keys,
+        dyntype.module_name,
+        dyntype.dyntype_get_keys,
+        binaryen.createType([dyntype.dyn_ctx_t, dyntype.dyn_value_t]),
+        dyntype.dyn_value_t,
+    );
+    module.addFunctionImport(
         dyntype.dyntype_new_extref,
         dyntype.module_name,
         dyntype.dyntype_new_extref,
@@ -309,9 +312,7 @@ export function importAnyLibAPI(module: binaryen.Module) {
         dyntype.module_name,
         dyntype.dyntype_to_string,
         binaryen.createType([dyntype.dyn_ctx_t, dyntype.dyn_value_t]),
-        getConfig().enableStringRef
-            ? _BinaryenTypeStringref()
-            : stringTypeInfo.typeRef,
+        dyntype.ts_string,
     );
     module.addFunctionImport(
         dyntype.dyntype_is_falsy,
@@ -462,6 +463,24 @@ export function importInfcLibAPI(module: binaryen.Module) {
     );
 }
 
+export function importMemoryAPI(module: binaryen.Module) {
+    module.addFunctionImport(
+        BuiltinNames.mallocFunc,
+        BuiltinNames.externalModuleName,
+        BuiltinNames.mallocFunc,
+        binaryen.createType([binaryen.i32]),
+        binaryen.i32,
+    );
+
+    module.addFunctionImport(
+        BuiltinNames.freeFunc,
+        BuiltinNames.externalModuleName,
+        BuiltinNames.freeFunc,
+        binaryen.createType([binaryen.i32]),
+        binaryen.none,
+    );
+}
+
 export function generateGlobalContext(module: binaryen.Module) {
     module.addGlobal(
         dyntype.dyntype_context,
@@ -484,7 +503,7 @@ export function generateExtRefTableMaskArr(module: binaryen.Module) {
     const name = getBuiltInFuncName(BuiltinNames.extRefTableMaskArr);
     module.addGlobal(
         name,
-        charArrayTypeInfo.typeRef,
+        i8ArrayTypeInfo.typeRef,
         true,
         module.ref.null(dyntype.dyn_ctx_t),
     );
@@ -516,8 +535,15 @@ export function addItableFunc(module: binaryen.Module) {
     );
     const itableLib = fs.readFileSync(itableFilePath, 'utf-8');
     const watModule = binaryen.parseText(itableLib);
-    UtilFuncs.addWatFuncs(watModule, 'find_index', module);
-    module.addFunctionExport('find_index', 'find_index');
-    UtilFuncs.addWatFuncs(watModule, 'find_type_by_index', module);
+    UtilFuncs.addWatFuncs(
+        watModule,
+        BuiltinNames.findPropertyFlagAndIndex,
+        module,
+    );
+    module.addFunctionExport(
+        BuiltinNames.findPropertyFlagAndIndex,
+        BuiltinNames.findPropertyFlagAndIndex,
+    );
+    UtilFuncs.addWatFuncs(watModule, BuiltinNames.findPropertyType, module);
     watModule.dispose();
 }

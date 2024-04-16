@@ -16,14 +16,21 @@ import {
     ScopeKind,
 } from './scope.js';
 import { Parameter, Variable } from './variable.js';
-import { Expression, IdentifierExpression } from './expression.js';
+import { Expression } from './expression.js';
 import { Logger } from './log.js';
 import {
     DefaultTypeId,
-    createClassScopeByClassType,
+    MutabilityKind,
+    NullabilityKind,
+    PackedTypeKind,
+    processGenericType,
     isTypeGeneric,
+    createScopeBySpecializedType,
+    isWASMArrayComment,
+    isWASMStructComment,
+    parseCommentBasedTypeAliasNode,
 } from './utils.js';
-import { TypeError, UnimplementError } from './error.js';
+import { CommentError, TypeError } from './error.js';
 import { BuiltinNames } from '../lib/builtin/builtin_name.js';
 
 export const enum TypeKind {
@@ -40,12 +47,15 @@ export const enum TypeKind {
     NULL = 'null',
     INTERFACE = 'interface',
     UNION = 'unoin',
+    TUPLE = 'tuple',
 
     WASM_I32 = 'i32',
     WASM_I64 = 'i64',
     WASM_F32 = 'f32',
     WASM_F64 = 'f64',
     WASM_ANYREF = 'anyref',
+    WASM_ARRAY = 'wasm_array',
+    WASM_STRUCT = 'wasm_struct',
 
     GENERIC = 'generic',
     UNKNOWN = 'unknown',
@@ -100,6 +110,14 @@ export class WasmType extends Type {
                 this.typeKind = TypeKind.WASM_ANYREF;
                 break;
             }
+            case TypeKind.WASM_ARRAY: {
+                this.typeKind = TypeKind.WASM_ARRAY;
+                break;
+            }
+            case TypeKind.WASM_STRUCT: {
+                this.typeKind = TypeKind.WASM_STRUCT;
+                break;
+            }
             default: {
                 this.typeKind = TypeKind.UNKNOWN;
                 break;
@@ -109,6 +127,71 @@ export class WasmType extends Type {
 
     public getName(): string {
         return this.name;
+    }
+}
+
+export class WasmArrayType extends WasmType {
+    arrayType: TSArray;
+    packedTypeKind: PackedTypeKind = PackedTypeKind.Not_Packed;
+    mutability: MutabilityKind = MutabilityKind.Mutable;
+    nullability: NullabilityKind = NullabilityKind.Nullable;
+
+    constructor(
+        arrayType: TSArray,
+        packedTypeKind?: PackedTypeKind,
+        mutability?: MutabilityKind,
+        nullability?: NullabilityKind,
+    ) {
+        super(TypeKind.WASM_ARRAY);
+        this.arrayType = arrayType;
+        if (packedTypeKind) {
+            this.packedTypeKind = packedTypeKind;
+        }
+        if (mutability) {
+            this.mutability = mutability;
+        }
+        if (nullability) {
+            this.nullability = nullability;
+        }
+    }
+}
+
+export class WasmStructType extends WasmType {
+    tupleType: TSTuple;
+    packedTypeKinds: PackedTypeKind[];
+    mutabilitys: MutabilityKind[];
+    nullability: NullabilityKind = NullabilityKind.Nullable;
+    baseType: WasmStructType | undefined = undefined;
+
+    constructor(
+        tupleType: TSTuple,
+        packedTypeKinds?: PackedTypeKind[],
+        mutabilitys?: MutabilityKind[],
+        nullability?: NullabilityKind,
+        baseType?: WasmStructType,
+    ) {
+        super(TypeKind.WASM_STRUCT);
+        this.tupleType = tupleType;
+        if (packedTypeKinds) {
+            this.packedTypeKinds = packedTypeKinds;
+        } else {
+            this.packedTypeKinds = new Array<PackedTypeKind>(
+                this.tupleType.elements.length,
+            );
+            this.packedTypeKinds.fill(PackedTypeKind.Not_Packed);
+        }
+        if (mutabilitys) {
+            this.mutabilitys = mutabilitys;
+        } else {
+            this.mutabilitys = new Array<MutabilityKind>(
+                this.tupleType.elements.length,
+            );
+            this.mutabilitys.fill(MutabilityKind.Mutable);
+        }
+        if (nullability) {
+            this.nullability = nullability;
+        }
+        this.baseType = baseType;
     }
 }
 
@@ -286,6 +369,7 @@ export interface ClassMethod {
 
 export class TSTypeWithArguments extends Type {
     private _typeArguments?: TSTypeParameter[];
+    private _specializedArguments?: Type[];
     private _genericOwner?: TSTypeWithArguments;
     private _belongedScope?: Scope;
 
@@ -299,8 +383,14 @@ export class TSTypeWithArguments extends Type {
 
     addTypeParameter(type: TSTypeParameter) {
         if (!this._typeArguments) this._typeArguments = [];
-
-        this._typeArguments.push(type); // ignore the index
+        if (
+            !this._typeArguments.find(
+                (t) =>
+                    t.name == type.name &&
+                    t.wideType.kind == type.wideType.kind,
+            )
+        )
+            this._typeArguments.push(type); // ignore the index
     }
 
     setTypeParameters(types: TSTypeParameter[] | undefined) {
@@ -330,6 +420,14 @@ export class TSTypeWithArguments extends Type {
     setBelongedScope(scope: Scope | undefined) {
         this._belongedScope = scope;
     }
+
+    get specializedArguments(): Type[] | undefined {
+        return this._specializedArguments;
+    }
+
+    setSpecializedArguments(types: Type[] | undefined) {
+        this._specializedArguments = types;
+    }
 }
 
 const enum TraverseStatus {
@@ -348,6 +446,7 @@ export class TSClass extends TSTypeWithArguments {
     private _staticFields: Array<TsClassField> = [];
     private _methods: Array<TsClassFunc> = [];
     private _baseClass: TSClass | null = null;
+    private _drivedClasses: TSClass[] | null = null;
     private implInfc: TSInterface | null = null;
     private _isLiteral = false;
     private _ctor: TSFunction | null = null;
@@ -367,7 +466,7 @@ export class TSClass extends TSTypeWithArguments {
 
     toString(): string {
         return `Class(${this._name}(${this._mangledName} ${
-            this._isLiteral ? 'Literanl' : ''
+            this._isLiteral ? 'Literal' : ''
         }))`;
     }
 
@@ -423,6 +522,15 @@ export class TSClass extends TSTypeWithArguments {
         return this._baseClass;
     }
 
+    setDrivedClass(drived: TSClass): void {
+        if (!this._drivedClasses) this._drivedClasses = [];
+        this._drivedClasses.push(drived);
+    }
+
+    getDrivedClasses(): TSClass[] | null {
+        return this._drivedClasses;
+    }
+
     setImplInfc(infc: TSInterface | null): void {
         this.implInfc = infc;
     }
@@ -469,7 +577,9 @@ export class TSClass extends TSTypeWithArguments {
 
     addMethod(classMethod: TsClassFunc): void {
         classMethod.type.isMethod = true;
-        classMethod.type.belongedClass = this;
+        // when sub class inherits the method of the base class, it should not modify the 'belongedClass'.
+        if (!classMethod.type.belongedClass)
+            classMethod.type.belongedClass = this;
         this._methods.push(classMethod);
     }
 
@@ -484,6 +594,21 @@ export class TSClass extends TSTypeWithArguments {
             return { index: res, method: this.memberFuncs[res] };
         }
         return { index: -1, method: null };
+    }
+
+    updateMethod(
+        name: string,
+        kind: FunctionKind = FunctionKind.METHOD,
+        funcType: TSFunction,
+    ): boolean {
+        const res = this.memberFuncs.findIndex((f) => {
+            return name === f.name && kind === f.type.funcKind;
+        });
+        if (res !== -1) {
+            this.memberFuncs[res].type = funcType;
+            return true;
+        }
+        return false;
     }
 
     setClassName(name: string) {
@@ -532,6 +657,10 @@ export class TSArray extends Type {
         this.typeKind = TypeKind.ARRAY;
     }
 
+    set elementType(type: Type) {
+        this._elemType = type;
+    }
+
     get elementType(): Type {
         return this._elemType;
     }
@@ -555,7 +684,6 @@ export class TSFunction extends TSTypeWithArguments {
     private _isExport = false;
     // iff the function is a member function of a class
     private _belongedClass?: TSClass = undefined;
-    public envParamLen = 0;
 
     toString(): string {
         const s: string[] = [];
@@ -670,7 +798,6 @@ export class TSFunction extends TSTypeWithArguments {
         func._restParamIdex = this._restParamIdex;
         func._returnType = this._returnType;
         func.setTypeParameters(this.typeArguments);
-        func.envParamLen = this.envParamLen;
         func.setBelongedScope(this.belongedScope);
         func.belongedClass = this.belongedClass;
 
@@ -772,24 +899,50 @@ export class TSEnum extends Type {
     }
 }
 
+export class TSTuple extends Type {
+    typeKind = TypeKind.TUPLE;
+    private _elements: Type[] = [];
+
+    constructor() {
+        super();
+    }
+
+    get elements(): Array<Type> {
+        return this._elements;
+    }
+
+    addType(type: Type) {
+        this._elements.push(type);
+    }
+
+    toString(): string {
+        const s: string[] = [];
+        this._elements.forEach((t) => s.push(t.toString()));
+        return `Tuple[${s.join(' , ')}]`;
+    }
+}
+
+interface TsCustomType {
+    tsType: ts.Type;
+    customName: string;
+}
+
 export class TypeResolver {
     typechecker: ts.TypeChecker | undefined = undefined;
     globalScopes: Array<GlobalScope>;
     currentScope: Scope | null = null;
     nodeScopeMap: Map<ts.Node, Scope>;
-    tsTypeMap = new Map<ts.Type, Type>();
-    tsDeclTypeMap = new Map<ts.Declaration, Type>();
-    tsArrayTypeMap = new Map<ts.Type, Type>();
-    builtInTsTypeMap = new Map<ts.Type, Type>();
+    tsTypeMap = new Map<TsCustomType, Type>();
     private symbolTypeMap = new Map<ts.Node, Type>();
     nodeTypeCache = new Map<ts.Node, Type>();
-    specializedTypeCache = new Map<Type, Map<string, Type>[]>();
+    static specializedTypeCache = new Map<Type, Map<string, Type>[]>();
+    static typeParameterIndex = 0;
 
     private loopEntry: TSClass | null = null;
     private typeRefsMap = new Map<TSClass, Set<TSClass>>();
     /** when parsing class type, its base type must be already parsed */
     private parsedClassTypes = new Set<TSClass>();
-    typeParameterStack: TSTypeWithArguments[] = [];
+    typeParameterStack: TSTypeParameter[] = [];
 
     constructor(private parserCtx: ParserContext) {
         this.nodeScopeMap = this.parserCtx.nodeScopeMap;
@@ -887,45 +1040,69 @@ export class TypeResolver {
                                 return this.tsTypeToType(t);
                             },
                         );
-                        const specificType = TypeResolver.createSpecializedType(
+                        const specificType = processGenericType(
                             type,
                             aliasTypes,
-                            type as TSClass,
+                            (type as TSClass).typeArguments!,
+                            this.parserCtx,
                         ) as TSClass;
                         specificType.isLiteral = true;
                         // TODO: in this case, specificType can't be recursive
                         this.typeIdAllocate(specificType);
                         this.symbolTypeMap.set(node, specificType);
                         this.parsedClassTypes.add(specificType);
-                        this.addTypeToTypeMap(specificType, node);
+                        this.addTypeToScopeTypeMap(specificType, node);
                     }
                 } else {
                     type = this.generateNodeType(symbolNode);
-                    // specialization of generic types when using type alias
-                    if (
-                        tsType.aliasTypeArguments &&
-                        this.noTypeParmeters(tsType.aliasTypeArguments) &&
-                        type instanceof TSTypeWithArguments
-                    ) {
-                        const specializedTypes = tsType.aliasTypeArguments.map(
-                            (t) => {
-                                return this.tsTypeToType(t);
-                            },
-                        );
-                        type = TypeResolver.createSpecializedType(
-                            type,
-                            specializedTypes,
-                            type,
-                        );
+                    // if type is generic, may need to deal with the generic chain
+                    if (isTypeGeneric(type)) {
+                        if (type instanceof TSTypeWithArguments) {
+                            let typeArguments: Type[] = [];
+                            const typeParameters = type.typeArguments;
+                            // e.g.
+                            //  type ItemGenerator<T, U> = (item: T, index: U) => void
+                            //  function test_func<T, U>(func: ItemGenerator<U, T>, a: T, b: U) {...}
+                            if (tsType.aliasTypeArguments) {
+                                typeArguments = tsType.aliasTypeArguments!.map(
+                                    (t) => {
+                                        return this.tsTypeToType(t);
+                                    },
+                                );
+                            } else if (this.isTypeReference(tsType)) {
+                                // e.g.
+                                //  class Foo<T, U> {...};
+                                //  function bar<X, Y>(a: Foo<Y, X>, data: Y[]) {...}
+                                typeArguments =
+                                    this.typechecker!.getTypeArguments(
+                                        tsType as ts.TypeReference,
+                                    ).map((t) => {
+                                        return this.tsTypeToType(t);
+                                    });
+                            }
+                            if (typeParameters)
+                                type = processGenericType(
+                                    type,
+                                    typeArguments,
+                                    typeParameters,
+                                    this.parserCtx,
+                                );
+                        }
                     }
                 }
-                this.addTypeToTypeMap(type, symbolNode);
+                const customTypeName = this.getTsTypeRawName(node);
+                this.addTypeToTSTypeMap(
+                    tsType,
+                    customTypeName ? customTypeName : '',
+                    type,
+                );
+                this.addTypeToScopeTypeMap(type, symbolNode);
                 break;
             }
             case ts.SyntaxKind.ObjectLiteralExpression: {
                 const type = this.symbolTypeMap.get(node)!;
                 this.parseObjectType(node, type as TSClass);
-                this.addTypeToTypeMap(type, node);
+                this.addTypeToScopeTypeMap(type, node);
                 break;
             }
             case ts.SyntaxKind.ClassDeclaration: {
@@ -934,7 +1111,7 @@ export class TypeResolver {
                     node as ts.ClassDeclaration,
                     classType as TSClass,
                 );
-                this.addTypeToTypeMap(classType, node);
+                this.addTypeToScopeTypeMap(classType, node);
                 break;
             }
             case ts.SyntaxKind.InterfaceDeclaration: {
@@ -943,48 +1120,114 @@ export class TypeResolver {
                     node as ts.InterfaceDeclaration,
                     infcType as TSInterface,
                 );
-                this.addTypeToTypeMap(type, node);
+                this.addTypeToScopeTypeMap(type, node);
                 this.symbolTypeMap.set(node, type);
                 return;
             }
             case ts.SyntaxKind.UnionType: {
-                const tsType = this.typechecker!.getTypeFromTypeNode(
-                    node as ts.UnionTypeNode,
+                const unionTypeNode = node as ts.UnionTypeNode;
+                const tsType =
+                    this.typechecker!.getTypeFromTypeNode(unionTypeNode);
+                const type = this.parseUnionType(
+                    tsType as ts.UnionType,
+                    unionTypeNode,
                 );
-                const type = this.parseUnionType(tsType as ts.UnionType);
-                this.addTypeToTypeMap(type, node);
+                this.addTypeToScopeTypeMap(type, node);
                 break;
             }
             case ts.SyntaxKind.EnumDeclaration: {
                 const type = this.parseEnumType(node as ts.EnumDeclaration);
-                this.addTypeToTypeMap(type, node);
+                this.addTypeToScopeTypeMap(type, node);
                 break;
             }
             case ts.SyntaxKind.FunctionDeclaration:
             case ts.SyntaxKind.FunctionExpression:
             case ts.SyntaxKind.ArrowFunction: {
                 const type = this.generateNodeType(node);
-                this.addTypeToTypeMap(type, node);
+                this.addTypeToScopeTypeMap(type, node);
                 break;
             }
             case ts.SyntaxKind.TypeAliasDeclaration: {
                 const typeAliasNode = <ts.TypeAliasDeclaration>node;
                 const typeName = typeAliasNode.name.getText();
+                let type: Type;
                 const tsType =
                     this.typechecker!.getTypeAtLocation(typeAliasNode);
-                const type = this.generateNodeType(typeAliasNode.type);
-
-                // if it is a generic type, complete its typeArguments
-                if (
-                    tsType.aliasTypeArguments &&
-                    type instanceof TSTypeWithArguments
-                ) {
-                    const typeArgs = tsType.aliasTypeArguments.map((t) => {
-                        return this.tsTypeToType(t) as TSTypeParameter;
-                    });
-                    type.setTypeParameters(typeArgs);
+                /* 1. check if typeName is in builtinWasmType */
+                if (builtinWasmTypes.has(typeName)) {
+                    type = builtinWasmTypes.get(typeName)!;
+                } else {
+                    const parseRes =
+                        parseCommentBasedTypeAliasNode(typeAliasNode);
+                    type = this.generateNodeType(typeAliasNode);
+                    /* 2. check if type is WASMArray/WASMStruct type */
+                    if (
+                        parseRes &&
+                        (isWASMArrayComment(parseRes) ||
+                            isWASMStructComment(parseRes))
+                    ) {
+                        if (isWASMArrayComment(parseRes)) {
+                            if (!(type instanceof TSArray)) {
+                                throw new CommentError(
+                                    `${type.toString()} is not array type`,
+                                );
+                            }
+                            type = new WasmArrayType(
+                                type,
+                                parseRes.packedType,
+                                parseRes.mutability,
+                                parseRes.nullability,
+                            );
+                        } else {
+                            if (!(type instanceof TSTuple)) {
+                                throw new CommentError(
+                                    `${type.toString()} is not tuple type`,
+                                );
+                            }
+                            let findRes: Type | undefined = undefined;
+                            if (parseRes.baseTypeName) {
+                                findRes = this.currentScope!.findType(
+                                    parseRes.baseTypeName,
+                                );
+                            }
+                            const baseType: WasmStructType | undefined = findRes
+                                ? (findRes as WasmStructType)
+                                : undefined;
+                            type = new WasmStructType(
+                                type,
+                                parseRes.packedTypes,
+                                parseRes.mutabilitys,
+                                parseRes.nullability,
+                                baseType,
+                            );
+                        }
+                    } else {
+                        /* 3. check if type is TSTypeWithArguments */
+                        if (
+                            tsType.aliasTypeArguments &&
+                            type instanceof TSTypeWithArguments
+                        ) {
+                            const typeArgs = tsType.aliasTypeArguments.map(
+                                (t) => {
+                                    return this.tsTypeToType(
+                                        t,
+                                    ) as TSTypeParameter;
+                                },
+                            );
+                            type.setTypeParameters(typeArgs);
+                        }
+                    }
                 }
+
+                this.addTypeToTSTypeMap(tsType, typeName, type);
                 this.currentScope!.addType(typeName, type);
+                break;
+            }
+            case ts.SyntaxKind.AsExpression: {
+                const asExprNode = <ts.AsExpression>node;
+                const typeNode = asExprNode.type;
+                const type = this.generateNodeType(typeNode);
+                this.addTypeToScopeTypeMap(type, node);
                 break;
             }
             default:
@@ -993,16 +1236,42 @@ export class TypeResolver {
         ts.forEachChild(node, this.visitNode.bind(this));
     }
 
-    private addTypeToTypeMap(type: Type, node: ts.Node) {
-        let tsTypeString = this.typechecker!.typeToString(
-            this.typechecker!.getTypeAtLocation(node),
-        );
-
-        const maybeWasmType = TypeResolver.maybeBuiltinWasmType(node);
-        if (maybeWasmType) {
-            tsTypeString = maybeWasmType.getName();
+    private getTypeFromTSTypeMap(tsType: ts.Type, customName: string) {
+        for (const tsCustomType of this.tsTypeMap.keys()) {
+            if (
+                tsCustomType.tsType === tsType &&
+                tsCustomType.customName === customName
+            ) {
+                return this.tsTypeMap.get(tsCustomType);
+            }
         }
+        return undefined;
+    }
 
+    private addTypeToTSTypeMap(
+        tsType: ts.Type,
+        customName: string,
+        type: Type,
+    ) {
+        for (const tsCustomType of this.tsTypeMap.keys()) {
+            if (
+                tsCustomType.tsType === tsType &&
+                tsCustomType.customName === customName
+            ) {
+                this.tsTypeMap.set(tsCustomType, type);
+                return;
+            }
+        }
+        const typeObj: TsCustomType = {
+            tsType: tsType,
+            customName: customName,
+        };
+        this.tsTypeMap.set(typeObj, type);
+        return;
+    }
+
+    private addTypeToScopeTypeMap(type: Type, node: ts.Node) {
+        const tsTypeString = this.getTsTypeName(node);
         if (
             this.currentScope!.kind === ScopeKind.FunctionScope &&
             type.kind === TypeKind.FUNCTION &&
@@ -1018,7 +1287,7 @@ export class TypeResolver {
                 (type as TSClass).setBelongedScope(this.currentScope!);
             }
         } else if (ts.isObjectLiteralExpression(node)) {
-            if (this.currentScope?.parent) {
+            if (this.currentScope!.parent) {
                 this.currentScope!.parent!.addType(tsTypeString, type);
             }
             if (this.currentScope! instanceof ClassScope) {
@@ -1029,19 +1298,66 @@ export class TypeResolver {
         }
     }
 
+    getTsTypeRawName(node: ts.Node, isReturnType = false): string | undefined {
+        if (ts.isTypeNode(node)) {
+            return node.getText();
+        } else if (ts.isTypeReferenceNode(node)) {
+            /* If one node is FunctionLike, then its type will be its return type */
+            if (!ts.isFunctionLike(node.parent) || isReturnType) {
+                const typeRawName = node.getText();
+                return typeRawName;
+            }
+        } else if ((node as any).type) {
+            return this.getTsTypeRawName((node as any).type, isReturnType);
+        }
+        return undefined;
+    }
+
+    getTsTypeName(node: ts.Node) {
+        let tsTypeString: string | undefined = undefined;
+        if (ts.isFunctionLike(node)) {
+            /* if node is function like, then it must stored in nodeTypeCache */
+            tsTypeString = this.nodeTypeCache.get(node)!.toString();
+        } else {
+            tsTypeString = this.getTsTypeRawName(node);
+        }
+        if (!tsTypeString) {
+            tsTypeString = this.typechecker!.typeToString(
+                this.typechecker!.getTypeAtLocation(node),
+            );
+        }
+        return tsTypeString!;
+    }
+
+    getTypeByInitializer(node: ts.Node): Type | undefined {
+        if (ts.isPropertyAssignment(node)) {
+            const initTypeName = this.getTsTypeRawName(node.initializer);
+            const initTsType = this.typechecker!.getTypeAtLocation(
+                node.initializer,
+            );
+            return this.getTypeFromTSTypeMap(
+                initTsType,
+                initTypeName ? initTypeName : '',
+            );
+        }
+        return undefined;
+    }
+
     generateNodeType(node: ts.Node): Type {
         if (!this.typechecker) {
             this.typechecker = this.parserCtx.typeChecker;
         }
-        /* Resolve wasm specific type */
-        const maybeWasmType = TypeResolver.maybeBuiltinWasmType(node);
-        if (maybeWasmType) {
-            return maybeWasmType;
-        }
+        /* 1. get type from cached type */
         const cached_type = this.nodeTypeCache.get(node);
         if (cached_type) {
             return cached_type;
         }
+        /* 2. For wasmType, some node type should be equal with its initializer type */
+        const initializerType = this.getTypeByInitializer(node);
+        if (initializerType) {
+            return initializerType;
+        }
+        /* 3. special node kind should be parsed as signature */
         if (ts.isConstructSignatureDeclaration(node)) {
             return this.parseSignature(
                 this.typechecker!.getSignatureFromDeclaration(
@@ -1056,16 +1372,45 @@ export class TypeResolver {
                 )!,
             );
         }
+        if (ts.isSetAccessorDeclaration(node)) {
+            return this.parseSignature(
+                this.typechecker!.getSignatureFromDeclaration(
+                    node as ts.SetAccessorDeclaration,
+                )!,
+            );
+        }
+        if (ts.isGetAccessorDeclaration(node)) {
+            return this.parseSignature(
+                this.typechecker!.getSignatureFromDeclaration(
+                    node as ts.GetAccessorDeclaration,
+                )!,
+            );
+        }
+        /* 4. handle this type */
         let tsType = this.typechecker!.getTypeAtLocation(node);
         if ('isThisType' in tsType && (tsType as any).isThisType) {
             /* For "this" keyword, tsc will inference the actual type */
             tsType = this.typechecker!.getDeclaredTypeOfSymbol(tsType.symbol);
         }
-        let type = this.tsTypeToType(tsType);
-
-        /* for example, a: string[] = new Array(), the type of new Array() should be string[]
-         instead of any[]*/
-        if (type instanceof TSArray) {
+        /* 5. customed type should find from tsTypeMap firstly */
+        const tsTypeRawName = this.getTsTypeRawName(node);
+        const parsedType = this.getTypeFromTSTypeMap(
+            tsType,
+            tsTypeRawName ? tsTypeRawName : '',
+        );
+        if (parsedType) {
+            return parsedType;
+        }
+        /* 6. parse tsType to type */
+        let type = this.tsTypeToType(tsType, node);
+        /* 7. set right value's type based on left value's type */
+        if (type instanceof TSArray || type instanceof TSTuple) {
+            /** Example: a: string[] = new Array()
+             *  the type of new Array() should be string[], instead of any[]
+             */
+            /** Example: const a: [i32, string] = [1, 'hi'];
+             *  the type of [1, 'hi'] should be [i32, string], instead of [number, string]
+             */
             const parentNode = node.parent;
             if (
                 ts.isVariableDeclaration(parentNode) ||
@@ -1078,12 +1423,28 @@ export class TypeResolver {
                 ts.isNewExpression(parentNode) ||
                 ts.isArrayLiteralExpression(parentNode)
             ) {
-                const parentType = <TSArray>this.generateNodeType(parentNode);
-                if (parentType.kind == TypeKind.ANY) {
-                    type = parentType;
+                const parentType = this.generateNodeType(parentNode);
+                if (type instanceof TSArray) {
+                    if (parentType.kind == TypeKind.ANY) {
+                        type = parentType;
+                    } else {
+                        type = (<TSArray>parentType).elementType;
+                    }
                 } else {
-                    type = (<TSArray>this.generateNodeType(parentNode))
-                        .elementType;
+                    if (ts.isArrayLiteralExpression(parentNode)) {
+                        if (parentType instanceof TSTuple) {
+                            const parentFieldLength =
+                                parentType.elements.length;
+                            for (let i = 0; i < parentFieldLength; i++) {
+                                if (parentNode.elements[i] === node) {
+                                    type = (<TSTuple>parentType).elements[i];
+                                    break;
+                                }
+                            }
+                        } else {
+                            type = (<TSArray>parentType).elementType;
+                        }
+                    }
                 }
             }
         }
@@ -1091,12 +1452,32 @@ export class TypeResolver {
         return type;
     }
 
-    public tsTypeToType(type: ts.Type): Type {
+    public tsTypeToType(
+        tsType: ts.Type,
+        tsNode?: ts.Node,
+        isReturnType = false,
+    ): Type {
         let res: Type | undefined;
+        const typeNode: ts.TypeNode | undefined = tsNode
+            ? ts.isTypeNode(tsNode)
+                ? tsNode
+                : (tsNode as any).type
+            : undefined;
+        /* 1. if typeNode is provided, then find from tsTypeMap firstly */
+        if (typeNode) {
+            const tsTypeRawName = this.getTsTypeRawName(typeNode, isReturnType);
+            const parsedType = this.getTypeFromTSTypeMap(
+                tsType,
+                tsTypeRawName ? tsTypeRawName : '',
+            );
+            if (parsedType) {
+                return parsedType;
+            }
+        }
 
-        const typeFlag = type.flags;
+        /* 1. generate type by tsType */
+        const typeFlag = tsType.flags;
         let mask = ts.TypeFlags.Number;
-
         if (typeFlag & mask && !(~typeFlag & mask)) {
             res = builtinTypes.get('number');
         }
@@ -1138,52 +1519,77 @@ export class TypeResolver {
         }
         mask = ts.TypeFlags.TypeParameter;
         if (!res && typeFlag & mask && !(~typeFlag & mask)) {
-            const type_name = type.symbol.getName();
-            for (let i = this.typeParameterStack.length - 1; i >= 0; i--) {
-                const typeWithArgs = this.typeParameterStack[i];
-                const type = typeWithArgs.getTypeParameter(type_name);
-                if (type) return type;
-            }
-
-            const type_param = this.currentScope!.findType(type_name);
-            if (!type_param || type_param.kind != TypeKind.TYPE_PARAMETER) {
-                throw new TypeError(
-                    `Cannot find the type ${type_name} or it isn't a TypeParameter (${type_param})`,
+            if (tsType.symbol.declarations) {
+                const type_name = tsType.symbol.getName();
+                const tp = tsType.symbol
+                    .declarations[0] as ts.TypeParameterDeclaration;
+                const constraint_node =
+                    ts.getEffectiveConstraintOfTypeParameter(tp);
+                let wide_type: Type = builtinTypes.get('generic')!;
+                if (constraint_node) {
+                    // TypeNode
+                    const constraint_tstype =
+                        this.typechecker!.getTypeFromTypeNode(constraint_node);
+                    wide_type = this.tsTypeToType(constraint_tstype);
+                }
+                let default_type: Type | undefined = undefined;
+                const default_node = tp.default;
+                if (default_node) {
+                    const default_tstype =
+                        this.typechecker!.getTypeFromTypeNode(default_node);
+                    default_type = this.tsTypeToType(default_tstype);
+                }
+                const found = this.typeParameterStack.find(
+                    (t) =>
+                        t.name == type_name &&
+                        t.wideType.kind == wide_type.kind,
                 );
+                if (found) return found;
+
+                const type_param = new TSTypeParameter(
+                    type_name,
+                    wide_type,
+                    TypeResolver.typeParameterIndex++,
+                    default_type,
+                );
+                this.typeParameterStack.push(type_param);
+                return type_param;
             }
-            return type_param!;
-            //return builtinTypes.get('generic')!;
         }
-        if (!res && type.symbol && type.symbol.declarations) {
-            const typeDecl = type.symbol.declarations[0];
+        if (!res && tsType.symbol && tsType.symbol.declarations) {
+            const typeDecl = tsType.symbol.declarations[0];
             if (typeDecl.kind == ts.SyntaxKind.EnumDeclaration) {
                 res = this.parseEnumType(typeDecl as ts.EnumDeclaration);
             }
         }
-        if (!res && type.isUnion()) {
-            res = this.parseUnionType(type);
+        if (!res && tsType.isUnion()) {
+            res = this.parseUnionType(tsType, typeNode as ts.UnionTypeNode);
         }
-        if (!res && this.isArray(type)) {
-            if (!type.typeArguments) {
+        if (!res && this.isArray(tsType)) {
+            if (!tsType.typeArguments) {
                 throw new TypeError('array type has no type arguments');
             }
-            const elemType = this.tsTypeToType(type.typeArguments![0]);
+            const elemType = this.tsTypeToType(
+                tsType.typeArguments![0],
+                typeNode ? (typeNode as any).elementType : undefined,
+            );
             res = new TSArray(elemType);
         }
         if (
             !res &&
-            (this.isTypeReference(type) ||
-                this.isInterface(type) ||
-                this.isObjectLiteral(type) ||
-                this.isObjectType(type))
+            (this.isTypeReference(tsType) ||
+                this.isInterface(tsType) ||
+                this.isObjectLiteral(tsType) ||
+                this.isObjectType(tsType)) &&
+            tsType.symbol
         ) {
-            const decls = type.symbol.declarations;
+            const decls = tsType.symbol.declarations;
             if (decls) {
-                const decl = type.symbol.declarations![0];
-                const tsType = this.symbolTypeMap.get(decl);
-                if (!tsType) {
+                const decl = tsType.symbol.declarations![0];
+                const type = this.symbolTypeMap.get(decl);
+                if (!type) {
                     throw new TypeError(
-                        `class/interface/object type not found, type name <${type.symbol.name}>. `,
+                        `class/interface/object type not found, type name <${tsType.symbol.name}>. `,
                     );
                 }
                 // Type references (ObjectFlags.Reference)
@@ -1191,53 +1597,25 @@ export class TypeResolver {
                     /* The 'isTypeReference' function uses bit operators to determine whether the type is a Reference
                      * But this result is not always correct
                      */
-                    this.isTypeReference(type) &&
-                    type.objectFlags == ts.ObjectFlags.Reference
+                    this.isTypeReference(tsType) &&
+                    tsType.objectFlags == ts.ObjectFlags.Reference
                 ) {
                     const typeArguments = this.typechecker!.getTypeArguments(
-                        type as ts.TypeReference,
+                        tsType as ts.TypeReference,
                     ).map((t) => {
                         return this.tsTypeToType(t);
                     });
 
-                    // generate a string signature of typeArguments to facilitate information storage
-                    const typeNames = new Array<string>();
-                    typeArguments.forEach((v) => {
-                        typeNames.push(`${v.kind}`);
-                    });
-                    const typeSignature = '<' + typeNames.join(',') + '>';
-
-                    // Determine whether a specialized type already exists
-                    // If it exists, return it directly
-                    const cache = this.specializedTypeCache.get(tsType);
-                    if (cache) {
-                        let found: Type | undefined;
-                        cache.forEach((v) => {
-                            if (v.has(typeSignature)) {
-                                found = v.get(typeSignature);
-                            }
-                        });
-                        if (found) return found;
-                    }
-
-                    res = TypeResolver.createSpecializedType(
-                        tsType,
+                    res = processGenericType(
+                        type,
                         typeArguments,
-                        tsType as TSClass,
+                        (type as TSClass).typeArguments!,
+                        this.parserCtx,
                     );
-                    if (this.specializedTypeCache.has(tsType)) {
-                        const value = new Map();
-                        value.set(typeSignature, res);
-                        this.specializedTypeCache.get(tsType)!.push(value);
-                    } else {
-                        const value = new Map();
-                        value.set(typeSignature, res);
-                        this.specializedTypeCache.set(tsType, [value]);
-                    }
                 } else {
-                    res = tsType;
+                    res = type;
                 }
-            } else if (type.symbol.flags & ts.TypeFlags.Substitution) {
+            } else if (tsType.symbol.flags & ts.TypeFlags.Substitution) {
                 /** TODO: symbol.declarations == undefined, means type always
                  * has TypeFlags.Substitution flag??
                  */
@@ -1245,38 +1623,75 @@ export class TypeResolver {
             } else {
                 throw new TypeError(
                     `class/interface/object type contains neither declarations
-                    nor Substitution flag, type name  <${type.symbol.name}>. `,
+                    nor Substitution flag, type name  <${tsType.symbol.name}>. `,
                 );
             }
         }
-        if (!res && this.isFunction(type)) {
-            const signature = type.getCallSignatures()[0];
+        if (!res && this.isFunction(tsType)) {
+            const signature = tsType.getCallSignatures()[0];
             res = this.parseSignature(signature);
         }
 
+        if (!res && this.isTupleType(tsType)) {
+            res = this.parseTupleType(
+                tsType as ts.TupleType,
+                typeNode as ts.TupleTypeNode,
+            );
+        }
+
         if (!res) {
-            Logger.debug(`Encounter un-processed type: ${type.flags}`);
+            Logger.warn(`Encounter un-processed type: ${tsType.flags}`);
             res = new Type();
         }
         return res;
     }
 
-    private parseUnionType(type: ts.UnionType): Type {
-        const union_type = new TSUnion();
-
-        if (!type.types) {
-            return builtinTypes.get('any')!;
+    private parseTupleType(
+        tsType: ts.TupleType,
+        tupleTypeNode?: ts.TupleTypeNode,
+    ) {
+        const tupleType = new TSTuple();
+        if (tupleTypeNode && tupleTypeNode.elements) {
+            for (const tupleElement of tupleTypeNode.elements) {
+                const tupleElementType = this.generateNodeType(tupleElement);
+                tupleType.addType(tupleElementType);
+            }
+        } else {
+            if (!tsType.typeArguments) {
+                throw new Error(`ts tuple type's typeArguments is undefined`);
+            }
+            for (const typeArg of tsType.typeArguments) {
+                tupleType.addType(this.tsTypeToType(typeArg));
+            }
         }
+        return tupleType;
+    }
 
-        for (const tstype of type.types) {
-            union_type.addType(this.tsTypeToType(tstype));
+    private parseUnionType(
+        tsUnionType: ts.UnionType,
+        unionTypeNode?: ts.UnionTypeNode,
+    ): Type {
+        const union_type = new TSUnion();
+        /* 1. get type from typeNode firstly */
+        if (unionTypeNode && unionTypeNode.types) {
+            for (const typeNode of unionTypeNode.types) {
+                const type = this.generateNodeType(typeNode);
+                union_type.addType(type);
+            }
+        } else {
+            /* 2. get type from tsUnionType */
+            if (!tsUnionType.types) {
+                return builtinTypes.get('any')!;
+            }
+            for (const tsType of tsUnionType.types) {
+                union_type.addType(this.tsTypeToType(tsType));
+            }
         }
 
         const types = union_type.types;
         if (types.every((type) => type === types[0])) {
             return types[0];
         }
-
         // T | null will be treated as nullable T type
         if (types.find((type) => type.kind === TypeKind.NULL)) {
             const nonNullTypes = types.filter(
@@ -1304,6 +1719,9 @@ export class TypeResolver {
             let value: number | string = start;
             if (member.initializer) {
                 value = this.parseEnumMemberValue(enumType, member.initializer);
+                if (member.initializer.kind == ts.SyntaxKind.NumericLiteral) {
+                    start = (value as number) + 1;
+                }
             } else {
                 start++;
             }
@@ -1373,20 +1791,38 @@ export class TypeResolver {
     }
 
     private isObjectLiteral(type: ts.Type) {
-        return this.isObject(type) && type.symbol.name === '__object';
+        return (
+            this.isObject(type) &&
+            type.symbol &&
+            type.symbol.name === '__object'
+        );
     }
 
     // in most cases, the type has Anonymous ObjectTypeFlag
     private isObjectType(type: ts.Type) {
         return (
             this.isObject(type) &&
+            type.symbol &&
             type.symbol.name === '__type' &&
             !this.isFunction(type)
         );
     }
 
+    private isTupleType(tsType: ts.Type) {
+        if (this.isTypeReference(tsType)) {
+            if ((tsType.target.objectFlags & ts.ObjectFlags.Tuple) !== 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private isArray(type: ts.Type): type is ts.TypeReference {
-        return this.isTypeReference(type) && type.symbol.name === 'Array';
+        return (
+            this.isTypeReference(type) &&
+            type.symbol &&
+            type.symbol.name === 'Array'
+        );
     }
 
     private isFunction(type: ts.Type): type is ts.ObjectType {
@@ -1405,7 +1841,6 @@ export class TypeResolver {
         this.nodeTypeCache.set(node, tsClass);
 
         if (ts.isTypeAliasDeclaration(node.parent)) {
-            this.typeParameterStack.push(tsClass);
             this.parseTypeParameters(tsClass, node.parent, this.currentScope);
         }
         const type = this.typechecker!.getTypeAtLocation(node);
@@ -1417,26 +1852,19 @@ export class TypeResolver {
                     `property ${propName} has no declaration when parsing object type`,
                 );
             }
-            const propType = this.typechecker!.getTypeAtLocation(valueDecl);
-            const tsType = this.tsTypeToType(propType);
+            const tsType = this.generateNodeType(valueDecl);
 
-            if (tsType instanceof TSFunction && tsType.isMethod) {
-                if (tsType.envParamLen == 1) {
-                    tsClass.addMethod({
-                        name: propName,
-                        type: tsType as TSFunction,
-                        optional: (valueDecl as any).questionToken
-                            ? true
-                            : false,
-                    });
-                } else {
-                    this.setMethod(
-                        valueDecl as ts.MethodDeclaration,
-                        null,
-                        tsClass,
-                        FunctionKind.METHOD,
-                    );
-                }
+            /* put all object literal's METHOD into vtable, FIELD into instance */
+            if (
+                tsType instanceof TSFunction &&
+                ts.isMethodDeclaration(valueDecl)
+            ) {
+                this.setMethod(
+                    valueDecl as ts.MethodDeclaration,
+                    null,
+                    tsClass,
+                    FunctionKind.METHOD,
+                );
             } else {
                 tsClass.addMemberField({
                     name: propName,
@@ -1496,14 +1924,7 @@ export class TypeResolver {
             ts.isMethodSignature(decl) ||
             ts.isAccessor(decl);
 
-        /* get env type length: @context & @this */
-        if (tsFunction.envParamLen === 0) {
-            tsFunction.envParamLen =
-                tsFunction.isMethod && !tsFunction.isStatic ? 2 : 1;
-        }
-
         /* parse original parameters type */
-        this.typeParameterStack.push(tsFunction);
         // TODO check currentScope is right
         this.parseTypeParameters(
             tsFunction,
@@ -1525,27 +1946,53 @@ export class TypeResolver {
             } else {
                 tsFunction.addIsOptionalParam(false);
             }
-            let tsType = this.tsTypeToType(
-                this.typechecker!.getTypeAtLocation(valueDecl),
-            );
-
-            /* builtin wasm types */
-            const maybeWasmType = TypeResolver.maybeBuiltinWasmType(valueDecl);
-            if (maybeWasmType) {
-                tsType = maybeWasmType;
+            const tsType = this.typechecker!.getTypeAtLocation(valueDecl);
+            let customType = this.tsTypeToType(tsType, (valueDecl as any).type);
+            // if this parameter type is generic, may need to deal with the generic chain
+            if (isTypeGeneric(customType)) {
+                //function and class
+                if (customType instanceof TSTypeWithArguments) {
+                    let typeArguments: Type[] = [];
+                    // e.g.
+                    //  type ItemGenerator<T, U> = (item: T, index: U) => void
+                    //  function test_func<T, U>(func: ItemGenerator<U, T>, a: T, b: U) {...}
+                    if (tsType.aliasTypeArguments) {
+                        typeArguments = tsType.aliasTypeArguments!.map((t) => {
+                            return this.tsTypeToType(t);
+                        });
+                    } else if (this.isTypeReference(tsType)) {
+                        // e.g.
+                        //  class Foo<T, U> {...};
+                        //  function bar<X, Y>(a: Foo<Y, X>, data: Y[]) {...}
+                        typeArguments = this.typechecker!.getTypeArguments(
+                            tsType as ts.TypeReference,
+                        ).map((t) => {
+                            return this.tsTypeToType(t);
+                        });
+                    }
+                    if (customType.typeArguments)
+                        customType = processGenericType(
+                            customType,
+                            typeArguments,
+                            customType.typeArguments,
+                            this.parserCtx,
+                        );
+                } else {
+                    //TODO
+                }
             }
-
-            tsFunction.addParamType(tsType);
+            tsFunction.addParamType(customType);
         });
 
         /* parse return type */
-        const returnType =
-            this.typechecker!.getReturnTypeOfSignature(signature);
-        tsFunction.returnType = this.tsTypeToType(returnType);
+        const returnType = signature.getReturnType();
+        const customType = this.tsTypeToType(returnType, decl.type, true);
+        tsFunction.returnType = customType;
 
         this.nodeTypeCache.set(decl, tsFunction);
         return tsFunction;
     }
+
     private parseNestDeclare(
         node:
             | ts.FunctionLikeDeclaration
@@ -1602,6 +2049,8 @@ export class TypeResolver {
     }
 
     private parseInfcType(node: ts.InterfaceDeclaration, infc: TSInterface) {
+        if (this.parsedClassTypes.has(infc)) return infc;
+
         this.nodeTypeCache.set(node, infc);
         infc.setClassName(node.name!.getText());
 
@@ -1609,13 +2058,12 @@ export class TypeResolver {
         //     this.parseTypeParameterIndex(node.typeParameters, infc);
         // }
         this.parseTypeParameters(infc, node, this.currentScope);
-        this.typeParameterStack.push(infc);
         infc.isDeclare = this.parseNestDeclare(node);
 
         const heritages = node.heritageClauses;
         const baseClassType: TSClass | null = null;
         let baseInfcType: TSInterface | null = null;
-        const effectTypeArguments = new Array<TSTypeParameter>();
+        const typeArguments = new Array<TSTypeParameter>();
         /** if extends more than two classes, an error will be thrown,
          *  if extends a class, implements some interface, the subclass is subtype of supclass,
          *  but do not guarantee that it will be a subtype of the interface either.
@@ -1634,7 +2082,7 @@ export class TypeResolver {
                     const baseType = this.symbolTypeMap.get(baseDecl);
                     if (type.typeArguments) {
                         type.typeArguments.forEach((t) => {
-                            effectTypeArguments.push(
+                            typeArguments.push(
                                 this.generateNodeType(t) as TSTypeParameter,
                             );
                         });
@@ -1673,28 +2121,27 @@ export class TypeResolver {
             }
         }
 
-        if (baseInfcType && isTypeGeneric(baseInfcType)) {
-            const _infc = infc;
-            const _effectTypeArguments = effectTypeArguments;
-
+        if (
+            baseInfcType &&
+            isTypeGeneric(baseInfcType) &&
+            typeArguments.length > 0
+        ) {
             // For the same interface base on different inheritance chains, we will regenerate a new base infc type.
             // The purpose is to prevent these base types from affecting each other.
             // e.g.
             //  interface IGeneric<X> {...};
             //  interface IGenericBase1<X, Y> extends IGeneric<Y> {...};
             //  interface IGenericBase2<X> extends IGeneric<X> {...};
-            const newName = infc.className + '_' + baseInfcType.className;
-            baseInfcType = TypeResolver.createSpecializedType(
+            baseInfcType = processGenericType(
                 baseInfcType,
-                _effectTypeArguments,
-                baseInfcType,
-                newName,
+                typeArguments,
+                baseInfcType.typeArguments!,
+                this.parserCtx,
             ) as TSInterface;
             infc.setBase(baseInfcType);
             baseInfcType.overrideOrOwnMethods.forEach((t) => {
                 infc.overrideOrOwnMethods.add(t);
             });
-            this.currentScope!.addType(newName, baseInfcType);
         }
 
         if (baseInfcType) {
@@ -1703,7 +2150,11 @@ export class TypeResolver {
                 infc.addMemberField(field);
             }
             for (const method of baseInfcType.memberFuncs) {
-                infc.addMethod(method);
+                infc.addMethod({
+                    name: method.name,
+                    type: method.type.clone(),
+                    optional: method.optional,
+                });
             }
         }
 
@@ -1736,32 +2187,10 @@ export class TypeResolver {
             } else if (member.kind === ts.SyntaxKind.CallSignature) {
                 continue;
             }
-            let funcKind =
+            const funcKind =
                 member.kind == ts.SyntaxKind.ConstructSignature
                     ? FunctionKind.CONSTRUCTOR
                     : FunctionKind.METHOD;
-            if (ts.isSetAccessor(member)) {
-                const type = new TSFunction();
-                type.addParamType(fieldType);
-                fieldType = type;
-                funcKind = FunctionKind.SETTER;
-                this.parseTypeParameters(
-                    type,
-                    member as ts.DeclarationWithTypeParameters,
-                    null,
-                );
-            }
-            if (ts.isGetAccessor(member)) {
-                const type = new TSFunction(FunctionKind.GETTER);
-                type.returnType = fieldType;
-                fieldType = type;
-                funcKind = FunctionKind.GETTER;
-                this.parseTypeParameters(
-                    type,
-                    member as ts.DeclarationWithTypeParameters,
-                    null,
-                );
-            }
             const fieldName =
                 funcKind == FunctionKind.CONSTRUCTOR
                     ? 'constructor'
@@ -1775,8 +2204,13 @@ export class TypeResolver {
                 }
             }
             if (fieldType instanceof TSFunction) {
-                fieldType.funcKind = funcKind;
-                fieldType.envParamLen = 2;
+                if (ts.isSetAccessor(member)) {
+                    fieldType.funcKind = FunctionKind.SETTER;
+                } else if (ts.isGetAccessor(member)) {
+                    fieldType.funcKind = FunctionKind.GETTER;
+                } else {
+                    fieldType.funcKind = funcKind;
+                }
                 infc.addMethod({
                     name: fieldName,
                     type: fieldType,
@@ -1801,19 +2235,19 @@ export class TypeResolver {
     }
 
     private parseClassType(node: ts.ClassDeclaration, classType: TSClass) {
+        if (this.parsedClassTypes.has(classType)) return classType;
+
         this.nodeTypeCache.set(node, classType);
         classType.setClassName(node.name!.getText());
-
         const scope = this.parserCtx.nodeScopeMap.get(node)!;
         this.parseTypeParameters(classType, node, scope);
-        this.typeParameterStack.push(classType);
 
         classType.isDeclare = this.parseNestDeclare(node);
 
         const heritages = node.heritageClauses;
         let baseClassType: TSClass | null = null;
         let baseInfcType: TSInterface | null = null;
-        const effectTypeArguments = new Array<TSTypeParameter>();
+        const typeArguments = new Array<TSTypeParameter>();
         /** if extends more than two classes, an error will be thrown,
          *  if extends a class, implements some interface, the subclass is subtype of supclass,
          *  but do not guarantee that it will be a subtype of the interface either.
@@ -1831,7 +2265,7 @@ export class TypeResolver {
                     const baseType = this.symbolTypeMap.get(baseDecl);
                     if (type.typeArguments) {
                         type.typeArguments.forEach((t) => {
-                            effectTypeArguments.push(
+                            typeArguments.push(
                                 this.generateNodeType(t) as TSTypeParameter,
                             );
                         });
@@ -1868,18 +2302,21 @@ export class TypeResolver {
                     }
                     baseClassType = h;
                     classType.setBase(baseClassType);
+                    baseClassType.setDrivedClass(classType);
                 }
             }
         }
 
-        if (baseInfcType && isTypeGeneric(baseInfcType)) {
-            const _effectTypeArguments = effectTypeArguments;
-            const newName = classType.className + '_' + baseInfcType.className;
-            baseInfcType = TypeResolver.createSpecializedType(
+        if (
+            baseInfcType &&
+            isTypeGeneric(baseInfcType) &&
+            typeArguments.length > 0
+        ) {
+            baseInfcType = processGenericType(
                 baseInfcType,
-                _effectTypeArguments,
-                baseInfcType,
-                newName,
+                typeArguments,
+                baseInfcType.typeArguments!,
+                this.parserCtx,
             ) as TSInterface;
             classType.setImplInfc(baseInfcType);
             let _baseInfcType: TSClass | null = baseInfcType;
@@ -1900,24 +2337,37 @@ export class TypeResolver {
         // On the inheritance chain, the type parameter of Generic is Y,
         // and in its class definition, the type parameter is X.
         // So it needs to be corrected based on the actual type parameters on the inheritance chain.
-        if (baseClassType && isTypeGeneric(baseClassType)) {
-            const _classType = classType;
-            const _effectTypeArguments = effectTypeArguments;
-
+        if (
+            baseClassType &&
+            isTypeGeneric(baseClassType) &&
+            typeArguments.length > 0
+        ) {
             // For the same class base on different inheritance chains, we will regenerate a new base class type.
             // The purpose is to prevent these base types from affecting each other.
             // e.g.
             //  class Generic<X> {...};
             //  class GenericBase1<X, Y> extends Generic<Y> {...};
             //  class GenericBase2<X> extends Generic<X> {...};
-            const newName = classType.className + '_' + baseClassType.className;
-            baseClassType = TypeResolver.createSpecializedType(
+            baseClassType = processGenericType(
                 baseClassType,
-                _effectTypeArguments,
-                baseClassType,
-                newName,
+                typeArguments,
+                baseClassType.typeArguments!,
+                this.parserCtx,
+                classType.className,
             ) as TSClass;
             classType.setBase(baseClassType);
+            baseClassType.setDrivedClass(classType);
+            // create base generic class scope
+            const geneicOwner = baseClassType.genericOwner
+                ? baseClassType.genericOwner
+                : baseClassType;
+            if (geneicOwner.belongedScope) {
+                createScopeBySpecializedType(
+                    baseClassType,
+                    geneicOwner.belongedScope.parent!,
+                    this.parserCtx,
+                );
+            }
         }
 
         if (baseClassType) {
@@ -1932,7 +2382,11 @@ export class TypeResolver {
                 classType.addStaticMemberField(staticField);
             }
             for (const method of baseClassType.memberFuncs) {
-                classType.addMethod(method);
+                classType.addMethod({
+                    name: method.name,
+                    type: method.type.clone(),
+                    optional: method.optional,
+                });
             }
         }
 
@@ -1949,15 +2403,13 @@ export class TypeResolver {
             ctorScope.setFuncName('constructor');
             ctorScope.setClassName(node.name!.getText());
             ctorScope.addVariable(new Variable('this', classType));
-            ctorScope.envParamLen = 2;
 
             const ctorType = new TSFunction(FunctionKind.CONSTRUCTOR);
+            ctorType.belongedClass = classType;
             ctorType.setBelongedScope(ctorScope);
             ctorType.returnType = classType;
             ctorType.isMethod = true;
             classType.hasDeclareCtor = false;
-            /* insert params, variables, types */
-            ctorType.envParamLen = 2;
             ctorScope.setFuncType(ctorType);
             classType.ctorType = ctorType;
 
@@ -1966,10 +2418,11 @@ export class TypeResolver {
                 const paramTypes = baseCtorType.getParamTypes();
                 for (let i = 0; i < paramTypes.length; i++) {
                     const paramType = paramTypes[i];
-                    const newType = TypeResolver.createSpecializedType(
+                    const newType = processGenericType(
                         paramType,
-                        effectTypeArguments,
-                        classType,
+                        typeArguments,
+                        classType.typeArguments!,
+                        this.parserCtx,
                     );
                     if (!newType)
                         throw new TypeError('unimpl TSTypeParameter exchange');
@@ -2073,6 +2526,7 @@ export class TypeResolver {
             if (ts.isConstructorDeclaration(member)) {
                 const ctorType = this.parseConstructor(member);
                 ctorScope.setFuncType(ctorType);
+                ctorType.setBelongedScope(ctorScope);
                 classType.ctorType = ctorType;
                 ctorType.belongedClass = classType;
             }
@@ -2138,42 +2592,43 @@ export class TypeResolver {
     }
 
     private setMethod(
-        func: ts.AccessorDeclaration | ts.MethodDeclaration,
+        decl:
+            | ts.AccessorDeclaration
+            | ts.MethodDeclaration
+            | ts.PropertyAssignment,
         baseClassType: TSClass | null,
         classType: TSClass,
         funcKind: FunctionKind,
     ) {
-        const methodName = func.name.getText();
-        const type = this.generateNodeType(func);
+        const methodName = decl.name.getText();
+        let func:
+            | ts.AccessorDeclaration
+            | ts.MethodDeclaration
+            | ts.FunctionExpression;
+        if (ts.isPropertyAssignment(decl)) {
+            func = decl.initializer as ts.FunctionExpression;
+        } else {
+            func = decl;
+        }
+        const type = this.generateNodeType(func) as TSFunction;
         let tsFuncType = new TSFunction(funcKind);
-        /* record tsFuncType envParamLen: @context. @this */
-        tsFuncType.envParamLen = 2;
 
-        // if (func.typeParameters) {
-        //     this.parseTypeParameterIndex(func.typeParameters, tsFuncType);
-        // }
         const scope = this.parserCtx.nodeScopeMap.get(func)!;
         this.parseTypeParameters(tsFuncType, func, scope);
 
-        const nameWithPrefix = getMethodPrefix(funcKind) + func.name.getText();
-
-        if (type instanceof TSFunction) {
-            type.funcKind = tsFuncType.funcKind;
-            tsFuncType = type;
-        }
-        if (funcKind === FunctionKind.GETTER) {
-            tsFuncType.returnType = type;
-        }
-        if (funcKind === FunctionKind.SETTER) {
-            tsFuncType.addParamType(type);
-        }
+        const nameWithPrefix = getMethodPrefix(funcKind) + decl.name.getText();
+        type.funcKind = funcKind;
+        tsFuncType = type;
 
         let isOverride = false;
         if (baseClassType) {
             const baseFuncType = baseClassType.getMethod(methodName, funcKind)
                 .method?.type;
             if (baseFuncType) {
-                tsFuncType = baseFuncType;
+                if (!tsFuncType.belongedClass)
+                    tsFuncType.belongedClass = classType;
+                // override the method of base class
+                classType.updateMethod(methodName, funcKind, tsFuncType);
                 isOverride = true;
             }
         }
@@ -2193,6 +2648,42 @@ export class TypeResolver {
             tsFuncType.setBelongedScope(funcDef);
         }
         classType.overrideOrOwnMethods.add(nameWithPrefix);
+
+        // the accessor of the sub class are placed in front of the accessor of the base class for optimization.
+        const setterIndex = classType.getMethod(
+            methodName,
+            FunctionKind.SETTER,
+        ).index;
+        const isSetterOverrideOrOwn = classType.overrideOrOwnMethods.has(
+            `${'set_'}${methodName}`,
+        );
+        const getterIndex = classType.getMethod(
+            methodName,
+            FunctionKind.GETTER,
+        ).index;
+        const isGetterOverrideOrOwn = classType.overrideOrOwnMethods.has(
+            `${'get_'}${methodName}`,
+        );
+
+        if (setterIndex > -1 && getterIndex > -1) {
+            if (!isSetterOverrideOrOwn && setterIndex < getterIndex) {
+                [
+                    classType.memberFuncs[setterIndex],
+                    classType.memberFuncs[getterIndex],
+                ] = [
+                    classType.memberFuncs[getterIndex],
+                    classType.memberFuncs[setterIndex],
+                ];
+            } else if (!isGetterOverrideOrOwn && getterIndex < setterIndex) {
+                [
+                    classType.memberFuncs[getterIndex],
+                    classType.memberFuncs[setterIndex],
+                ] = [
+                    classType.memberFuncs[setterIndex],
+                    classType.memberFuncs[getterIndex],
+                ];
+            }
+        }
     }
 
     parseTypeParameters(
@@ -2203,7 +2694,6 @@ export class TypeResolver {
         const typeParams = ts.getEffectiveTypeParameterDeclarations(node);
         if (!typeParams) return;
 
-        let index = 0;
         for (const tp of typeParams!) {
             const name = tp.name.getText();
             const constraint_node =
@@ -2223,13 +2713,19 @@ export class TypeResolver {
                 default_type = this.tsTypeToType(default_tstype);
             }
 
-            const type_param = new TSTypeParameter(
-                name,
-                wide_type,
-                index++,
-                default_type,
+            let type_param: TSTypeParameter | undefined;
+            type_param = this.typeParameterStack.find(
+                (t) => t.name == name && t.wideType.kind == wide_type.kind,
             );
-
+            if (!type_param) {
+                type_param = new TSTypeParameter(
+                    name,
+                    wide_type,
+                    TypeResolver.typeParameterIndex++,
+                    default_type,
+                );
+                this.typeParameterStack.push(type_param);
+            }
             tstype.addTypeParameter(type_param);
 
             if (scope) {
@@ -2364,8 +2860,10 @@ export class TypeResolver {
                         func.name +
                         (func.optional ? '?: ' : ': ') +
                         this.getTypeString(func.type) +
+                        '(m)' +
                         ','),
             );
+        /* We add a (m) suffix to indicate this is a method rather than a field of function type */
 
         return str;
     }
@@ -2423,281 +2921,6 @@ export class TypeResolver {
         }
     }
 
-    public static createSpecializedType(
-        type: Type,
-        specializedArgs: Type[],
-        containType: TSTypeWithArguments,
-        newName?: string,
-    ): Type {
-        // the type that need to be specialized must be generic
-        if (!isTypeGeneric(type)) return type;
-
-        // SpecializedArgs MAY contain generic type.
-        // This situation currently occurs in the generic inheritance chain.
-        // e.g.
-        //  class Generic<X> {...};
-        //  class GenericBase<X, Y> extends Generic<Y> {...};
-        //
-        //  At this time, we need to change the type parameter of the generic Generic on the inheritance chain from X to Y.
-        let genericInheritance = false;
-        specializedArgs.forEach((t) => {
-            if (isTypeGeneric(t)) {
-                genericInheritance = true;
-            }
-        });
-
-        switch (type.kind) {
-            case TypeKind.VOID:
-            case TypeKind.BOOLEAN:
-            case TypeKind.NUMBER:
-            case TypeKind.ANY:
-            case TypeKind.UNDEFINED:
-            case TypeKind.STRING:
-            case TypeKind.UNKNOWN:
-            case TypeKind.NULL:
-            case TypeKind.WASM_I32:
-            case TypeKind.WASM_I64:
-            case TypeKind.WASM_F32:
-            case TypeKind.WASM_F64:
-            case TypeKind.WASM_ANYREF: {
-                return type;
-            }
-            case TypeKind.ARRAY: {
-                return new TSArray(
-                    this.createSpecializedType(
-                        (type as TSArray).elementType,
-                        specializedArgs,
-                        containType as TSTypeWithArguments,
-                    ),
-                );
-            }
-            case TypeKind.FUNCTION: {
-                const funcType = type as TSFunction;
-                const newFuncType = funcType.clone();
-                // specialized function does not have '_typeArguments' property
-                if (!genericInheritance)
-                    newFuncType.setTypeParameters(undefined);
-
-                // regenerate the parameter list
-                newFuncType.setParamTypes([]);
-                funcType.getParamTypes().forEach((paramType) => {
-                    newFuncType.addParamType(
-                        this.createSpecializedType(
-                            paramType,
-                            specializedArgs,
-                            containType as TSTypeWithArguments,
-                        ),
-                    );
-                });
-
-                // prevent infinite recursive call
-                if (
-                    funcType.isMethod &&
-                    funcType.returnType instanceof TSClass &&
-                    funcType.returnType.typeId == funcType.belongedClass?.typeId
-                )
-                    return newFuncType;
-
-                newFuncType.returnType = this.createSpecializedType(
-                    funcType.returnType,
-                    specializedArgs,
-                    containType as TSTypeWithArguments,
-                );
-                return newFuncType;
-            }
-            case TypeKind.CLASS:
-            case TypeKind.INTERFACE: {
-                const classType = type as TSClass;
-                let newType: TSClass;
-                if (type.kind === TypeKind.CLASS) {
-                    newType = new TSClass();
-                } else {
-                    newType = new TSInterface();
-                }
-
-                // generate the class name of the new class
-                const typeNames = new Array<string>();
-                specializedArgs.forEach((v) => {
-                    typeNames.push(`${v.kind}`);
-                });
-                if (genericInheritance) {
-                    // e.g.
-                    // In this generic inheritance chain case: class GenericBase<X, Y> extends Generic<Y> {...}
-                    // The name of the new generic class will be changed from a to Generic to Generic_GenericBase
-                    const specializedName = newName
-                        ? newName
-                        : classType.className;
-                    newType.setClassName(specializedName);
-                    specializedArgs.forEach((v) => {
-                        newType.addTypeParameter(v as TSTypeParameter);
-                    });
-                } else {
-                    // e.g.
-                    // Generic<X> -> Generic<string>
-                    const specializedName =
-                        classType.className + '<' + typeNames.join(',') + '>';
-                    newType.setClassName(specializedName);
-                    newType.setGenericOwner(classType);
-                }
-
-                // set the property value of the basic property
-                if (classType.getBase()) {
-                    const base = classType.getBase();
-                    const base_typeArguments = base!.typeArguments;
-
-                    /*
-                     * Calculate the specialization parameter list of the base class
-                     * based on the specialization parameter list and type parameter list of the inherited class
-                     */
-                    if (base_typeArguments) {
-                        const baseSpecializedArgs = new Array<Type>();
-                        if (specializedArgs) {
-                            for (
-                                let i = 0;
-                                i < base_typeArguments.length;
-                                i++
-                            ) {
-                                const genericType = base_typeArguments[
-                                    i
-                                ] as TSTypeParameter;
-                                const type = TypeResolver.createSpecializedType(
-                                    genericType,
-                                    specializedArgs,
-                                    classType,
-                                );
-                                baseSpecializedArgs.push(type);
-                            }
-                        }
-                        const newName =
-                            newType.className +
-                            '_' +
-                            base?.className.split('_').reverse()[0];
-                        newType.setBase(
-                            TypeResolver.createSpecializedType(
-                                base!,
-                                baseSpecializedArgs,
-                                base!,
-                                newName,
-                            ) as TSClass,
-                        );
-                    } else {
-                        newType.setBase(base!);
-                    }
-                }
-
-                newType.hasDeclareCtor = classType.hasDeclareCtor;
-                const implInfc = classType.getImplInfc();
-                if (implInfc && isTypeGeneric(implInfc)) {
-                    const infc_typeArguments = implInfc.typeArguments;
-                    if (infc_typeArguments) {
-                        const infcSpecializedArgs = new Array<Type>();
-                        if (specializedArgs) {
-                            for (
-                                let i = 0;
-                                i < infc_typeArguments.length;
-                                i++
-                            ) {
-                                const genericType = infc_typeArguments[
-                                    i
-                                ] as TSTypeParameter;
-                                const type = TypeResolver.createSpecializedType(
-                                    genericType,
-                                    specializedArgs,
-                                    classType,
-                                );
-                                infcSpecializedArgs.push(type);
-                            }
-                        }
-                        newType.setImplInfc(
-                            TypeResolver.createSpecializedType(
-                                implInfc,
-                                infcSpecializedArgs,
-                                implInfc,
-                            ) as TSInterface,
-                        );
-                    }
-                } else {
-                    newType.setImplInfc(implInfc);
-                }
-                newType.isDeclare = classType.isDeclare;
-                newType.isLiteral = classType.isLiteral;
-                newType.overrideOrOwnMethods = classType.overrideOrOwnMethods;
-                newType.traverseStatus = classType.traverseStatus;
-
-                // specialized member variables
-                classType.fields.forEach((field) => {
-                    newType.addMemberField({
-                        name: field.name,
-                        type: this.createSpecializedType(
-                            field.type,
-                            specializedArgs,
-                            containType as TSTypeWithArguments,
-                        ),
-                    });
-                });
-                // specialized member functions
-                classType.memberFuncs.forEach((func) => {
-                    newType.addMethod({
-                        name: func.name,
-                        type: this.createSpecializedType(
-                            func.type,
-                            specializedArgs,
-                            containType as TSTypeWithArguments,
-                        ) as TSFunction,
-                    });
-                });
-                classType.staticFields.forEach((field) => {
-                    newType.addStaticMemberField({
-                        name: field.name,
-                        type: this.createSpecializedType(
-                            field.type,
-                            specializedArgs,
-                            containType as TSTypeWithArguments,
-                        ),
-                    });
-                });
-                // specialized constructor
-                if (classType.ctorType) {
-                    newType.ctorType = this.createSpecializedType(
-                        classType.ctorType,
-                        specializedArgs,
-                        containType as TSTypeWithArguments,
-                    ) as TSFunction;
-                    newType.ctorType.returnType = newType;
-                }
-
-                // create the classScope to which the new class type belongs, but it doesn't always exist
-                const originalClassScope = classType.belongedScope;
-                if (!originalClassScope) return newType;
-                originalClassScope.parent?.addType(newType.className, newType);
-                const newClassScope = createClassScopeByClassType(
-                    originalClassScope as ClassScope,
-                    originalClassScope.parent!,
-                    newType,
-                );
-                newType.setBelongedScope(newClassScope);
-                return newType;
-            }
-            case TypeKind.TYPE_PARAMETER: {
-                const genericType = type as TSTypeParameter;
-                const typeArgs = containType.typeArguments;
-                if (specializedArgs && typeArgs) {
-                    for (let i = 0; i < typeArgs.length; i++) {
-                        if (typeArgs[i].name === genericType.name) {
-                            return specializedArgs[i];
-                        }
-                    }
-                    // return typeArg;
-                }
-
-                return builtinTypes.get('any')!;
-            }
-            default: {
-                throw new UnimplementError('Not implemented type: ${type}');
-            }
-        }
-    }
-
     public arrayTypeCheck(node: ts.Node): boolean {
         const parentNode = node.parent;
         if (
@@ -2711,6 +2934,46 @@ export class TypeResolver {
             }
         }
         return false;
+    }
+
+    public static findTypeInSpecialiezedTypeCache(
+        genericType: TSTypeWithArguments,
+        signature: string,
+    ) {
+        const genericOwner = genericType.genericOwner
+            ? genericType.genericOwner
+            : genericType;
+
+        const typeSignature =
+            genericType instanceof TSClass
+                ? genericType.className + signature
+                : signature;
+        const cache = TypeResolver.specializedTypeCache.get(genericOwner);
+        let found: Type | undefined;
+        if (cache) {
+            cache.forEach((v) => {
+                if (v.has(typeSignature)) {
+                    found = v.get(typeSignature);
+                }
+            });
+        }
+        if (found) return found;
+    }
+
+    public static updateSpecializedTypeCache(
+        genericType: TSTypeWithArguments,
+        typeSignature: string,
+        specializedType: Type,
+    ) {
+        if (TypeResolver.specializedTypeCache.has(genericType)) {
+            const value = new Map();
+            value.set(typeSignature, specializedType);
+            TypeResolver.specializedTypeCache.get(genericType)!.push(value);
+        } else {
+            const value = new Map();
+            value.set(typeSignature, specializedType);
+            TypeResolver.specializedTypeCache.set(genericType, [value]);
+        }
     }
 }
 

@@ -12,6 +12,7 @@ import {
     BlockNode,
     BreakNode,
     CaseClauseNode,
+    ContinueNode,
     DefaultClauseNode,
     ForNode,
     IfNode,
@@ -76,7 +77,11 @@ export class WASMStatementGen {
                 break;
             }
             case SemanticsKind.BREAK: {
-                res = this.wasmBreak(<BreakNode>stmt);
+                res = this.wasmBreakOrContinue(<BreakNode>stmt);
+                break;
+            }
+            case SemanticsKind.CONTINUE: {
+                res = this.wasmBreakOrContinue(<ContinueNode>stmt);
                 break;
             }
             case SemanticsKind.BASIC_BLOCK: {
@@ -205,6 +210,7 @@ export class WASMStatementGen {
         // )
         const flattenLoop: FlattenLoop = {
             label: stmt.label,
+            continueLabel: stmt.continueLabel ?? undefined,
             condition: WASMCond,
             statements: WASMStmts,
         };
@@ -251,6 +257,7 @@ export class WASMStatementGen {
         }
         const flattenLoop: FlattenLoop = {
             label: stmt.label,
+            continueLabel: stmt.continueLabel ?? undefined,
             condition: WASMCond,
             statements: WASMStmts,
             incrementor: WASMIncrementor,
@@ -273,58 +280,56 @@ export class WASMStatementGen {
 
     wasmSwitch(stmt: SwitchNode): binaryen.ExpressionRef {
         const caseClause = stmt.caseClause;
-        const condition = this.wasmCompiler.wasmExprComp.wasmExprGen(
-            stmt.condition,
+        const defaultClause = stmt.defaultClause;
+        const defaultClauseLen = defaultClause ? 1 : 0;
+        const indexOfDefault = defaultClause ? caseClause.length : -1;
+
+        /* set branches labels */
+        const branches: binaryen.ExpressionRef[] = new Array(
+            caseClause.length + defaultClauseLen,
         );
-        // this.WASMCompiler.addDebugInfoRef(stmt.switchCondition, WASMCond);
-        if (caseClause.length === 0) {
-            return this.wasmCompiler.module.nop();
-        }
-        const branches: binaryen.ExpressionRef[] = new Array(caseClause.length);
-        let indexOfDefault = -1;
-        let idx = 0;
         caseClause.forEach((clause, i) => {
-            if (clause.kind === SemanticsKind.DEFAULT_CLAUSE) {
-                indexOfDefault = i;
-            } else {
-                const caseCause = <CaseClauseNode>clause;
-                const causeRef = this.wasmCompiler.wasmExprComp.wasmExprGen(
-                    caseCause.caseVar,
-                );
-
-                // this.WASMCompiler.addDebugInfoRef(caseCause.caseExpr, causeRef);
-                branches[idx++] = this.module.br(
-                    'case' + i + stmt.label,
-                    this.wasmCompiler.wasmExprComp.operateBinaryExpr(
-                        stmt.condition,
-                        caseCause.caseVar,
-                        ts.SyntaxKind.EqualsEqualsEqualsToken,
-                    ),
-                );
-            }
+            branches[i] = this.module.br(
+                'case' + i + stmt.label,
+                this.wasmCompiler.wasmExprComp.operateBinaryExpr(
+                    stmt.condition,
+                    clause.caseVar,
+                    ts.SyntaxKind.EqualsEqualsEqualsToken,
+                ),
+            );
         });
-        const default_label =
-            indexOfDefault === -1
-                ? stmt.breakLabel
-                : 'case' + indexOfDefault + stmt.label;
-        branches[idx] = this.module.br(default_label);
+        if (defaultClause) {
+            branches[indexOfDefault] = this.module.br(
+                'case' + indexOfDefault + stmt.label,
+            );
+        }
 
+        /* set blocks */
         let block = this.module.block('case0' + stmt.label, branches);
-        for (let i = 0; i !== caseClause.length; ++i) {
-            const clause = <CaseClauseNode | DefaultClauseNode>caseClause[i];
-            const label =
-                i === caseClause.length - 1
-                    ? stmt.breakLabel
-                    : 'case' + (i + 1) + stmt.label;
+        caseClause.forEach((clause, i) => {
+            let label: string;
+            if (i === caseClause.length - 1 && !defaultClause) {
+                label = stmt.breakLabel;
+            } else {
+                label = 'case' + (i + 1) + stmt.label;
+            }
             block = this.module.block(
                 label,
                 [block].concat(this.WASMStmtGen(clause.body!)),
+            );
+        });
+        if (defaultClause) {
+            block = this.module.block(
+                stmt.breakLabel,
+                [block].concat(this.WASMStmtGen(defaultClause.body!)),
             );
         }
         return block;
     }
 
-    wasmBreak(stmt: BreakNode): binaryen.ExpressionRef {
+    wasmBreakOrContinue(
+        stmt: BreakNode | ContinueNode,
+    ): binaryen.ExpressionRef {
         return this.wasmCompiler.module.br(stmt.label);
     }
 

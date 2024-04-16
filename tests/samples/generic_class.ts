@@ -199,3 +199,79 @@ export function test_GenericClassWithTypeAlias() {
     console.log(obj2.a);
     console.log(obj2.b);
 }
+
+interface II<T> {
+    get(info: T) : T;
+}
+
+class A<T> implements II<T> {
+    get(info: T) {
+        return info;
+    }
+}
+
+function get(obj: any) {
+    return (obj as II<number>).get(1);
+}
+
+export function test_AS() {
+    const a = new A<number>();
+    console.log(get(a));
+}
+
+class M {
+    foo<T>(a: T) {
+        console.log('M.foo: ' + a);
+    }
+}
+
+class N extends M {
+    x: number
+
+    constructor(x: number) {
+        super();
+        this.x = x;
+    }
+    foo<T>(a: T) {
+        console.log('N.foo: ' + a);
+    }
+    bar<T>(a: T) {
+        console.log('N.bar: ' + a);
+    }
+}
+
+export function test_ClassWithGenericMethod() {
+    let m: M = new M();
+    m.foo(1);
+    m.foo('hello');
+
+    const n: N = new N(1);
+    n.foo(1);
+    n.foo('hello');
+    n.bar(2);
+    n.bar('world');
+
+    m.foo(false);
+    m = new N(2);
+    m.foo(true);
+}
+
+class Foo {
+    foo<T>(data: T[]) {
+        const a = data[0];
+        console.log(a);
+    }
+}
+
+class Bar {
+    bar<T>(a: Foo, data: T[]) {
+        a.foo(data);
+    }
+}
+
+export function test_GenericMethodCall() {
+   const foo = new Foo();
+   const bar = new Bar();
+   bar.bar(foo, [2, 3]);
+   bar.bar(foo, ['hello', 'world']);
+}

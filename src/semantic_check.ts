@@ -155,7 +155,7 @@ export default class SemanticChecker {
             if (expr.rightOperand instanceof PropertyAccessExpression) {
                 this.invokeAnyObjCheck(
                     expr.leftOperand.exprType,
-                    expr.rightOperand.propertyAccessExpr.exprType,
+                    expr.rightOperand.propertyExpr.exprType,
                 );
             }
         }
@@ -201,6 +201,9 @@ export default class SemanticChecker {
                     ErrorFlag.ArgsAndParamsTypesAreNominalClass,
                     `argument type and parameter type are nominal class types`,
                 );
+                if (!argExpr.exprType) {
+                    console.log('hh');
+                }
                 this.voidTypeCheck(argExpr.exprType.kind);
                 if (argExpr instanceof PropertyAccessExpression) {
                     this.invokeAnyObjCheck(
